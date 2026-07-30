@@ -1,0 +1,12 @@
+{
+  "name": "genlayer-lending-protocol",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "deploy": "genlayer deploy"
+  },
+  "devDependencies": {
+    "genlayer-js": "^1.1.8",
+    "typescript": "^5.4.0"
+  }
+}

@@ -1,0 +1,578 @@
+@import url("https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=Public+Sans:wght@400;500&family=JetBrains+Mono:wght@400;500&display=swap");
+
+:root {
+  --bg: #0a1520;
+  --panel: #0f1f2e;
+  --panel-2: #0c1a27;
+  --edge: #1c3348;
+  --wire: #4fa8d8;
+  --wire-dim: #2a5570;
+  --chalk: #dce7f0;
+  --muted: #7d97ac;
+  --mint: #55d6a0;
+  --amber: #f0a63c;
+  --red: #e86a5c;
+
+  --display: "Archivo", system-ui, sans-serif;
+  --body: "Public Sans", system-ui, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: var(--bg);
+  /* faint drafting grid */
+  background-image:
+    linear-gradient(rgba(79, 168, 216, 0.045) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(79, 168, 216, 0.045) 1px, transparent 1px);
+  background-size: 34px 34px;
+  color: var(--chalk);
+  font-family: var(--body);
+  font-size: 15px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+}
+
+.mono {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.wrap {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding: 40px 24px 72px;
+}
+
+/* ── header ─────────────────────────────────────────────── */
+.head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 28px;
+  flex-wrap: wrap;
+  margin-bottom: 40px;
+}
+
+.eyebrow {
+  margin: 0 0 8px;
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--wire);
+}
+
+.title {
+  margin: 0 0 12px;
+  font-family: var(--display);
+  font-size: clamp(30px, 5vw, 44px);
+  font-weight: 700;
+  letter-spacing: -0.025em;
+  line-height: 1.05;
+}
+
+.lede {
+  margin: 0;
+  max-width: 54ch;
+  color: var(--muted);
+}
+
+/* ── signature: the wire ────────────────────────────────── */
+.schematic {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 18px;
+  padding: 26px 24px;
+  margin-bottom: 28px;
+  background: var(--panel-2);
+  border: 1px solid var(--edge);
+  border-radius: 3px;
+}
+
+.node {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 12px 16px;
+  border: 1px solid var(--wire-dim);
+  border-radius: 2px;
+  background: var(--panel);
+}
+
+.nodeLabel {
+  font-family: var(--display);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.nodeAddr {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--wire);
+}
+
+.wire {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  min-width: 140px;
+}
+
+.wireLine {
+  position: relative;
+  display: block;
+  width: 100%;
+  height: 1px;
+  background: repeating-linear-gradient(
+    90deg,
+    var(--wire-dim) 0 7px,
+    transparent 7px 13px
+  );
+}
+
+.pulse {
+  position: absolute;
+  top: -2px;
+  left: 0;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--wire);
+  box-shadow: 0 0 9px var(--wire);
+  animation: flow 2.9s linear infinite;
+}
+
+@keyframes flow {
+  from {
+    left: 0;
+    opacity: 0;
+  }
+  12% {
+    opacity: 1;
+  }
+  88% {
+    opacity: 1;
+  }
+  to {
+    left: 100%;
+    opacity: 0;
+  }
+}
+
+.wireTag {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  font-size: 13px;
+  text-align: center;
+}
+
+.wireTag b {
+  font-size: 17px;
+  color: var(--mint);
+}
+
+.wireTag em {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-style: normal;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+/* ── layout ─────────────────────────────────────────────── */
+.grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
+}
+
+.panel {
+  padding: 24px;
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: 3px;
+}
+
+.panel.span {
+  grid-column: 1 / -1;
+}
+
+.panelTitle {
+  margin: 0 0 18px;
+  font-family: var(--display);
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--wire);
+}
+
+.empty {
+  margin: 0;
+  color: var(--muted);
+}
+
+/* ── stats ──────────────────────────────────────────────── */
+.stats {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px 14px;
+  margin: 0 0 22px;
+}
+
+.stats > div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-left: 11px;
+  border-left: 2px solid var(--edge);
+}
+
+.stats dt {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.stats dd {
+  margin: 0;
+  font-size: 22px;
+  line-height: 1.15;
+}
+
+.unit {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+/* ── health ─────────────────────────────────────────────── */
+.health {
+  padding: 14px 16px;
+  border: 1px solid var(--edge);
+  border-radius: 2px;
+  background: var(--panel-2);
+}
+
+.healthBar {
+  height: 3px;
+  margin-bottom: 10px;
+  background: var(--edge);
+  overflow: hidden;
+}
+
+.healthBar i {
+  display: block;
+  height: 100%;
+  background: var(--mint);
+  transition: width 0.4s ease;
+}
+
+.health.bad .healthBar i {
+  background: var(--red);
+}
+
+.health p {
+  margin: 0;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.health.bad p {
+  color: var(--red);
+}
+
+.wallet {
+  margin: 16px 0 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.wallet b {
+  color: var(--chalk);
+}
+
+/* ── form ───────────────────────────────────────────────── */
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 18px;
+}
+
+.field > span {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.field input {
+  padding: 11px 13px;
+  font-size: 17px;
+  color: var(--chalk);
+  background: var(--panel-2);
+  border: 1px solid var(--edge);
+  border-radius: 2px;
+}
+
+.field input:focus-visible,
+.actions button:focus-visible {
+  outline: 2px solid var(--wire);
+  outline-offset: 2px;
+}
+
+.field em {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-style: normal;
+  color: var(--muted);
+}
+
+/* ── buttons ────────────────────────────────────────────── */
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 9px;
+}
+
+.actions button {
+  padding: 10px 15px;
+  font-family: var(--display);
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  color: var(--bg);
+  background: var(--wire);
+  border: 1px solid var(--wire);
+  border-radius: 2px;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.actions button:hover:not(:disabled) {
+  background: #6fbde6;
+}
+
+.actions button.ghost {
+  color: var(--chalk);
+  background: transparent;
+  border-color: var(--edge);
+}
+
+.actions button.ghost:hover:not(:disabled) {
+  background: var(--panel-2);
+  border-color: var(--wire-dim);
+}
+
+.actions button.danger {
+  color: var(--bg);
+  background: var(--amber);
+  border-color: var(--amber);
+}
+
+.actions button.danger:hover:not(:disabled) {
+  background: #f5b95f;
+}
+
+.actions button.tiny {
+  padding: 6px 12px;
+  font-size: 12px;
+}
+
+.actions button:disabled,
+.protoRow button:disabled {
+  opacity: 0.38;
+  cursor: not-allowed;
+}
+
+.note {
+  margin: 16px 0 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.pending {
+  margin: 14px 0 0;
+  padding: 11px 13px;
+  font-size: 12px;
+  color: var(--amber);
+  background: rgba(240, 166, 60, 0.07);
+  border-left: 2px solid var(--amber);
+}
+
+/* ── saga ───────────────────────────────────────────────── */
+.saga {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin: 20px 0;
+  padding: 0;
+  list-style: none;
+  counter-reset: stage;
+}
+
+.saga li {
+  padding: 14px 16px;
+  background: var(--panel-2);
+  border: 1px solid var(--edge);
+  border-left: 2px solid var(--edge);
+  border-radius: 2px;
+  opacity: 0.55;
+  transition: opacity 0.25s ease, border-color 0.25s ease;
+}
+
+.saga li.on {
+  opacity: 1;
+  border-left-color: var(--wire);
+}
+
+.stage {
+  display: block;
+  margin-bottom: 5px;
+  font-family: var(--display);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.saga p {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+/* ── protocol row + log ─────────────────────────────────── */
+.protoRow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 26px;
+  padding-bottom: 18px;
+  margin-bottom: 16px;
+  border-bottom: 1px solid var(--edge);
+}
+
+.protoRow > div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.protoRow b {
+  font-size: 18px;
+}
+
+.protoRow b.small {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.protoLabel {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.protoRow button {
+  margin-left: auto;
+  padding: 6px 12px;
+  font-family: var(--display);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--chalk);
+  background: transparent;
+  border: 1px solid var(--edge);
+  border-radius: 2px;
+  cursor: pointer;
+}
+
+.protoRow button:hover:not(:disabled) {
+  border-color: var(--wire-dim);
+}
+
+.log {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.log li {
+  padding: 4px 0;
+  color: var(--chalk);
+}
+
+.log li.ok {
+  color: var(--mint);
+}
+
+.log li.err {
+  color: var(--red);
+}
+
+.log li.muted {
+  color: var(--muted);
+}
+
+/* ── footer ─────────────────────────────────────────────── */
+.foot {
+  display: flex;
+  justify-content: space-between;
+  gap: 18px;
+  flex-wrap: wrap;
+  margin-top: 34px;
+  padding-top: 18px;
+  border-top: 1px solid var(--edge);
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--muted);
+}
+
+/* ── responsive ─────────────────────────────────────────── */
+@media (max-width: 860px) {
+  .grid,
+  .stats,
+  .saga {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .schematic {
+    grid-template-columns: minmax(0, 1fr);
+    text-align: center;
+  }
+
+  .wireLine {
+    display: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pulse {
+    animation: none;
+    left: 50%;
+  }
+
+  .healthBar i,
+  .saga li,
+  .actions button {
+    transition: none;
+  }
+}
