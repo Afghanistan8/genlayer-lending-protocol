@@ -576,3 +576,184 @@ body {
     transition: none;
   }
 }
+/* ============================================================
+   APPEND THIS TO THE END OF web/src/app/globals.css
+   Validator risk committee panel — v6
+   ============================================================ */
+
+.verdict {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  grid-template-areas:
+    "main side"
+    "scale side";
+  gap: 14px 32px;
+  padding: 26px 24px;
+  margin-bottom: 16px;
+  background: var(--panel-2);
+  border: 1px solid var(--edge);
+  border-left: 3px solid var(--muted);
+  border-radius: 3px;
+}
+
+.verdict.t-calm { border-left-color: var(--mint); }
+.verdict.t-caution { border-left-color: var(--wire); }
+.verdict.t-stress { border-left-color: var(--amber); }
+.verdict.t-crisis { border-left-color: var(--red); }
+
+.verdictMain { grid-area: main; }
+
+.verdictLabel {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.verdictTier {
+  margin: 4px 0 4px;
+  font-family: var(--display);
+  font-size: clamp(26px, 4vw, 38px);
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  line-height: 1;
+  text-transform: uppercase;
+}
+
+.t-calm .verdictTier { color: var(--mint); }
+.t-caution .verdictTier { color: var(--wire); }
+.t-stress .verdictTier { color: var(--amber); }
+.t-crisis .verdictTier { color: var(--red); }
+
+.verdictBlurb {
+  margin: 0;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.verdictScale {
+  grid-area: scale;
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.verdictScale span {
+  padding: 4px 10px;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  color: var(--muted);
+  border: 1px solid var(--edge);
+  border-radius: 2px;
+  opacity: 0.5;
+}
+
+.verdictScale span.on {
+  opacity: 1;
+  color: var(--chalk);
+  border-color: var(--wire);
+  background: rgba(79, 168, 216, 0.1);
+}
+
+.verdictSide {
+  grid-area: side;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  align-items: flex-start;
+  min-width: 200px;
+  padding-left: 26px;
+  border-left: 1px solid var(--edge);
+}
+
+.verdictSide > div {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.verdictSide b { font-size: 17px; }
+
+.mono.accent { color: var(--amber); }
+
+.assess {
+  margin-top: 2px;
+  padding: 9px 14px;
+  font-family: var(--display);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--bg);
+  background: var(--wire);
+  border: 1px solid var(--wire);
+  border-radius: 2px;
+  cursor: pointer;
+}
+
+.assess:hover:not(:disabled) { background: #6fbde6; }
+.assess:disabled { opacity: 0.38; cursor: not-allowed; }
+
+.explainer {
+  margin: 0 0 16px;
+  padding: 14px 16px;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--muted);
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: 3px;
+}
+
+.explainer b { color: var(--chalk); }
+
+.explainer code {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--wire);
+}
+
+.alarm {
+  margin: 0 0 16px;
+  padding: 14px 16px;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--chalk);
+  background: rgba(232, 106, 92, 0.08);
+  border: 1px solid rgba(232, 106, 92, 0.35);
+  border-left: 3px solid var(--red);
+  border-radius: 3px;
+}
+
+.health .sub {
+  margin: 8px 0 0;
+  font-size: 12px;
+}
+
+.health .sub b { color: var(--chalk); }
+
+.evidence {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0 0 16px;
+  padding: 12px 14px;
+  background: var(--panel-2);
+  border: 1px solid var(--edge);
+  border-radius: 2px;
+  line-height: 1.5;
+}
+
+@media (max-width: 860px) {
+  .verdict {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas: "main" "scale" "side";
+  }
+
+  .verdictSide {
+    padding-left: 0;
+    padding-top: 16px;
+    border-left: none;
+    border-top: 1px solid var(--edge);
+  }
+}

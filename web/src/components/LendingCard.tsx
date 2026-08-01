@@ -17,27 +17,36 @@ import {
   POOL,
   LTV_BPS,
   LIQUIDATION_BPS,
+  TIERS,
   short,
 } from "@/config/contracts";
 
 type State = {
+  riskTier: string;
+  riskHaircutBps: string;
+  riskEpoch: string;
+  riskNote: string;
   collateral: string;
   debt: string;
   maxBorrow: string;
   liquidatable: boolean;
   collateralValue: string;
+  recognizedValue: string;
   tgenBalance: string;
   tusdcBalance: string;
   trackedLiquidity: string;
   trackedCollateral: string;
   liqPending: boolean;
   quoteRef: string;
+  quoteRecognized: string;
   reserveA: string;
   reserveB: string;
   errors: string[];
 };
 
 type LogLine = { text: string; kind: "info" | "ok" | "err" };
+
+const TIER_ORDER = ["CALM", "CAUTION", "STRESS", "CRISIS"];
 
 export default function LendingCard() {
   const { address, connector, isConnected } = useAccount();
@@ -70,7 +79,6 @@ export default function LendingCard() {
     void refresh();
   }, [refresh]);
 
-  /** One signed write, start to finish. */
   const write = useCallback(
     async (contract: string, fn: string, args: unknown[]) => {
       if (!address) throw new Error("Connect a wallet first.");
@@ -83,12 +91,12 @@ export default function LendingCard() {
         address: contract as `0x${string}`,
         functionName: fn,
         args: args as never,
-        value: 0n, // required by the SDK even when nothing is paid
+        value: 0n,
       });
       await client.waitForTransactionReceipt({
         hash,
         status: TransactionStatus.ACCEPTED,
-        retries: 120,
+        retries: 240,      // the risk vote needs longer than a plain write
         interval: 5000,
       });
       return hash as string;
@@ -96,7 +104,6 @@ export default function LendingCard() {
     [address, connector]
   );
 
-  /** Run a labelled sequence of writes, then refresh. */
   const run = useCallback(
     async (label: string, steps: Array<[string, string, unknown[], string]>) => {
       setBusy(label);
@@ -125,14 +132,17 @@ export default function LendingCard() {
   })();
 
   const disabled = !isConnected || busy !== null || amt <= 0n;
+  const tier = state?.riskTier || "";
+  const assessed = (state?.riskEpoch ?? "0") !== "0";
+  const haircutPct = Number(state?.riskHaircutBps ?? "0") / 100;
 
-  // Health: collateral value as a percentage of the liquidation ceiling.
+  const rawV = Number(state?.collateralValue ?? "0");
+  const recV = Number(state?.recognizedValue ?? "0");
   const debtN = Number(state?.debt ?? "0");
-  const valueN = Number(state?.collateralValue ?? "0");
-  const ceiling = debtN === 0 ? 0 : (debtN * 10000) / LIQUIDATION_BPS;
-  const healthPct =
-    debtN === 0 ? 100 : Math.max(0, Math.min(100, (1 - ceiling / (valueN || 1)) * 100 + 0));
-  const healthy = !state?.liquidatable;
+  const floor = debtN === 0 ? 0 : (debtN * 10000) / LIQUIDATION_BPS;
+  // The headline case: safe on market price, liquidatable on the verdict.
+  const verdictDrivenLiquidation =
+    debtN > 0 && rawV > floor && recV < floor && !!state?.liquidatable;
 
   return (
     <div className="wrap">
@@ -141,36 +151,81 @@ export default function LendingCard() {
           <p className="eyebrow">GenLayer · studionet</p>
           <h1 className="title">Lending &amp; Borrowing</h1>
           <p className="lede">
-            Borrow tUSDC against tGEN. Your credit line is priced in real time by
-            a decentralized exchange deployed from a different repository — the
-            two contracts share nothing but an address.
+            Borrow tUSDC against tGEN. The price comes from an exchange deployed
+            in a different repository — and how much of that price counts is
+            decided by GenLayer&rsquo;s validator committee, not by a formula.
           </p>
         </div>
         <ConnectButton showBalance={false} chainStatus="none" />
       </header>
 
-      {/* ── Signature: the live wire between the two contracts ── */}
-      <section className="schematic" aria-label="Cross-contract price link">
-        <div className="node">
-          <span className="nodeLabel">Lending protocol</span>
-          <code className="nodeAddr">{short(LENDING)}</code>
+      {/* ── The validator committee ── */}
+      <section className={`verdict ${tier ? `t-${tier.toLowerCase()}` : ""}`}>
+        <div className="verdictMain">
+          <span className="verdictLabel">Validator risk committee</span>
+          <p className="verdictTier">{tier || "not yet assessed"}</p>
+          <p className="verdictBlurb">
+            {tier && TIERS[tier]
+              ? TIERS[tier].blurb
+              : "Credit decisions are locked until the committee rules."}
+          </p>
         </div>
 
-        <div className="wire">
-          <span className="wireLine" aria-hidden="true">
-            <i className="pulse" />
-          </span>
-          <span className="wireTag">
-            <b className="mono">{state?.quoteRef ?? "—"}</b> tUSDC per 100 tGEN
-            <em>live view() call</em>
-          </span>
+        <div className="verdictScale" aria-hidden="true">
+          {TIER_ORDER.map((t) => (
+            <span key={t} className={t === tier ? "on" : ""}>
+              {t}
+            </span>
+          ))}
         </div>
 
-        <div className="node">
-          <span className="nodeLabel">Pool #1 · tGEN/tUSDC</span>
-          <code className="nodeAddr">{short(POOL)}</code>
+        <div className="verdictSide">
+          <div>
+            <span className="protoLabel">Market value · 100 tGEN</span>
+            <b className="mono">{state?.quoteRef ?? "—"}</b>
+          </div>
+          <div>
+            <span className="protoLabel">Recognized after haircut</span>
+            <b className="mono accent">{state?.quoteRecognized ?? "—"}</b>
+          </div>
+          <div>
+            <span className="protoLabel">Rulings settled</span>
+            <b className="mono">{state?.riskEpoch ?? "—"}</b>
+          </div>
+          <button
+            className="assess"
+            disabled={!isConnected || busy !== null}
+            onClick={() =>
+              run("assess", [
+                [LENDING, "assess_risk", [], "Validators judging the market"],
+              ])
+            }
+          >
+            {busy === "assess" ? "Committee voting…" : "Call a new ruling"}
+          </button>
         </div>
       </section>
+
+      <p className="explainer">
+        <b>How this works.</b> <code>assess_risk()</code> shows every validator
+        the same on-chain evidence — price, movement since the last ruling, pool
+        depth, protocol exposure — and asks each to judge, using its own model,
+        whether conditions are calm or stressed. They must reach consensus on one
+        verdict, and that verdict sets a haircut on every borrower&rsquo;s
+        collateral. It is not advice: <code>borrow()</code> and{" "}
+        <code>liquidate()</code> refuse to run until the committee has ruled.
+      </p>
+
+      {verdictDrivenLiquidation && (
+        <p className="alarm">
+          This position is worth <b className="mono">{rawV}</b> tUSDC at market
+          price — above the <b className="mono">{Math.ceil(floor)}</b> floor, so
+          it would be healthy on price alone. The committee&rsquo;s{" "}
+          <b>{tier}</b> ruling discounts it to <b className="mono">{recV}</b>,
+          which puts it below the floor. It is liquidatable because the
+          validators said so.
+        </p>
+      )}
 
       <div className="grid">
         {/* ── Position ── */}
@@ -188,36 +243,37 @@ export default function LendingCard() {
                   <span className="unit">tGEN</span>
                 </div>
                 <div>
-                  <dt>Worth now</dt>
+                  <dt>Market value</dt>
                   <dd className="mono">{state?.collateralValue ?? "—"}</dd>
                   <span className="unit">tUSDC</span>
+                </div>
+                <div>
+                  <dt>Recognized value</dt>
+                  <dd className="mono accent">{state?.recognizedValue ?? "—"}</dd>
+                  <span className="unit">after {haircutPct}% haircut</span>
                 </div>
                 <div>
                   <dt>Debt</dt>
                   <dd className="mono">{state?.debt ?? "—"}</dd>
                   <span className="unit">tUSDC</span>
                 </div>
-                <div>
-                  <dt>Still borrowable</dt>
-                  <dd className="mono">{state?.maxBorrow ?? "—"}</dd>
-                  <span className="unit">tUSDC</span>
-                </div>
               </dl>
 
-              <div className={`health ${healthy ? "ok" : "bad"}`}>
-                <div className="healthBar">
-                  <i style={{ width: `${healthPct}%` }} />
-                </div>
+              <div className={`health ${state?.liquidatable ? "bad" : "ok"}`}>
                 <p>
                   {debtN === 0
                     ? "No debt. Nothing to liquidate."
-                    : healthy
-                    ? `Safe — liquidation starts if the collateral falls below ${Math.ceil(
-                        ceiling
-                      )} tUSDC.`
-                    : `Underwater — collateral is below the ${Math.ceil(
-                        ceiling
-                      )} tUSDC floor and can be liquidated by anyone.`}
+                    : state?.liquidatable
+                    ? `Liquidatable — recognized value is below the ${Math.ceil(
+                        floor
+                      )} tUSDC floor.`
+                    : `Safe — liquidation begins if recognized value falls below ${Math.ceil(
+                        floor
+                      )} tUSDC.`}
+                </p>
+                <p className="sub">
+                  Still borrowable: <b className="mono">{state?.maxBorrow ?? "—"}</b>{" "}
+                  tUSDC — {LTV_BPS / 100}% of recognized value, minus debt.
                 </p>
               </div>
 
@@ -259,7 +315,8 @@ export default function LendingCard() {
             </button>
 
             <button
-              disabled={disabled}
+              disabled={disabled || !assessed}
+              title={assessed ? "" : "Needs a committee ruling first"}
               onClick={() => run("borrow", [[LENDING, "borrow", [amt], "Borrowing"]])}
             >
               Borrow tUSDC
@@ -311,17 +368,19 @@ export default function LendingCard() {
         <section className="panel span">
           <h2 className="panelTitle">Liquidation</h2>
           <p className="note">
-            When a position falls below the {LIQUIDATION_BPS / 100}% floor, anyone
-            can liquidate it. The protocol seizes the collateral and instructs
-            Pool #1 to sell it — then the proceeds are reconciled against the
-            debt. Three separate transactions, because GenLayer has no
-            synchronous cross-contract write.
+            A position is liquidatable when its debt exceeds{" "}
+            {LIQUIDATION_BPS / 100}% of its <em>recognized</em> value — market
+            price after the committee&rsquo;s haircut. Anyone can then trigger
+            it. The protocol seizes the collateral and instructs the pool to sell
+            it; the proceeds are reconciled against the debt afterwards. Three
+            transactions, because GenLayer has no synchronous cross-contract
+            write.
           </p>
 
           <ol className="saga">
             <li className={state?.liquidatable || state?.liqPending ? "on" : ""}>
               <span className="stage">Trigger</span>
-              <p>Live quote confirms the position is underwater.</p>
+              <p>Committee-adjusted value confirms the position is underwater.</p>
             </li>
             <li className={state?.liqPending ? "on" : ""}>
               <span className="stage">Sell</span>
@@ -389,15 +448,20 @@ export default function LendingCard() {
               <b className="mono">{LTV_BPS / 100}%</b>
             </div>
             <div>
-              <span className="protoLabel">Pool reserves</span>
-              <b className="mono small">
-                {state?.reserveA ?? "—"} / {state?.reserveB ?? "—"}
-              </b>
+              <span className="protoLabel">Priced by</span>
+              <b className="mono small">{short(POOL)}</b>
             </div>
             <button className="ghost tiny" onClick={refresh} disabled={loading}>
               {loading ? "Reading…" : "Refresh"}
             </button>
           </div>
+
+          {state?.riskNote && (
+            <p className="evidence">
+              <span className="protoLabel">Evidence put to the committee</span>
+              <span className="mono small">{state.riskNote}</span>
+            </p>
+          )}
 
           <ul className="log">
             {log.length === 0 ? (
