@@ -175,7 +175,9 @@ export default function LendingCard() {
       <section className={`verdict ${tier ? `t-${tier.toLowerCase()}` : ""}`}>
         <div className="verdictMain">
           <span className="verdictLabel">Validator risk committee</span>
-          <p className="verdictTier">{tier || "not yet assessed"}</p>
+          <p className="verdictTier">
+            {tier || (loading ? "reading…" : "not yet assessed")}
+          </p>
           <p className="verdictBlurb">
             {tier && TIERS[tier]
               ? TIERS[tier].blurb

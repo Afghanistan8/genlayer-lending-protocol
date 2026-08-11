@@ -11,6 +11,10 @@ import { LENDING, TGEN, TUSDC, POOL } from "@/config/contracts";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+// Studionet reads are ~1-1.5s each. Even fanned out (below) give the function
+// generous headroom so a slow round-trip can't trip the platform's default
+// serverless timeout and 504 the whole page.
+export const maxDuration = 30;
 
 const CACHE_MS = 15_000;                // studionet allows 500 requests/hour
 const cache = new Map<string, { at: number; body: unknown }>();
@@ -87,24 +91,44 @@ export async function GET(req: NextRequest) {
   const str = async (c: string, f: string, a: unknown[] = []) =>
     toStr(await read(c, f, a));
 
-  // ---- validator-settled risk state ----
-  const riskTier = await str(LENDING, "get_risk_tier");
-  const riskHaircutBps = await num(LENDING, "get_risk_haircut_bps");
-  const riskEpoch = await num(LENDING, "get_risk_epoch");
-  const riskNote = await str(LENDING, "get_risk_note");
-  // The committee's ruling — cites the LIVE Fear & Greed reading it judged.
-  const riskSignal = await str(LENDING, "get_risk_signal");
+  // Every read below is independent, so fan them out concurrently rather than
+  // awaiting one-by-one. Serialized, this route made ~13 studionet round-trips
+  // and took ~18s cold — past Vercel's serverless timeout, so the deployed
+  // page's fetch was killed and every value rendered as "—"/"not yet assessed".
+  // In parallel it lands in a couple of seconds. studionet's 500 req/hour budget
+  // is untouched (same number of reads, just not serialized) and the 15s cache
+  // still absorbs repeat loads.
 
-  // ---- protocol-wide ----
-  const trackedLiquidity = await num(LENDING, "get_tracked_liquidity");
-  const trackedCollateral = await num(LENDING, "get_tracked_collateral");
-  const liqPending = await bool(LENDING, "get_liq_pending");
-  const pendingLiqId = await num(LENDING, "get_pending_liq_id");
-  // Reference price at a fixed probe size: raw vs committee-recognized.
-  const quoteRef = await num(LENDING, "live_collateral_value", [100n]);
-  const quoteRecognized = await num(LENDING, "recognized_collateral_value", [100n]);
-  const reserveA = await num(POOL, "get_reserve_a");
-  const reserveB = await num(POOL, "get_reserve_b");
+  // ---- validator-settled risk state + protocol-wide (one concurrent wave) ----
+  const [
+    riskTier,
+    riskHaircutBps,
+    riskEpoch,
+    riskNote,
+    riskSignal, // committee's ruling — cites the LIVE Fear & Greed reading it judged
+    trackedLiquidity,
+    trackedCollateral,
+    liqPending,
+    pendingLiqId,
+    quoteRef, // reference price at a fixed probe size: raw ...
+    quoteRecognized, // ... vs committee-recognized
+    reserveA,
+    reserveB,
+  ] = await Promise.all([
+    str(LENDING, "get_risk_tier"),
+    num(LENDING, "get_risk_haircut_bps"),
+    num(LENDING, "get_risk_epoch"),
+    str(LENDING, "get_risk_note"),
+    str(LENDING, "get_risk_signal"),
+    num(LENDING, "get_tracked_liquidity"),
+    num(LENDING, "get_tracked_collateral"),
+    bool(LENDING, "get_liq_pending"),
+    num(LENDING, "get_pending_liq_id"),
+    num(LENDING, "live_collateral_value", [100n]),
+    num(LENDING, "recognized_collateral_value", [100n]),
+    num(POOL, "get_reserve_a"),
+    num(POOL, "get_reserve_b"),
+  ]);
 
   let collateral = "0";
   let debt = "0";
@@ -117,16 +141,23 @@ export async function GET(req: NextRequest) {
 
   if (address) {
     const a = addr(address);
-    collateral = await num(LENDING, "get_collateral", [a]);
-    debt = await num(LENDING, "get_debt", [a]);
-    maxBorrow = await num(LENDING, "max_borrow", [a]);
-    liquidatable = await bool(LENDING, "is_liquidatable", [a]);
-    tgenBalance = await num(TGEN, "balance_of", [a]);
-    tusdcBalance = await num(TUSDC, "balance_of", [a]);
+    // Per-account reads — another concurrent wave.
+    [collateral, debt, maxBorrow, liquidatable, tgenBalance, tusdcBalance] =
+      await Promise.all([
+        num(LENDING, "get_collateral", [a]),
+        num(LENDING, "get_debt", [a]),
+        num(LENDING, "max_borrow", [a]),
+        bool(LENDING, "is_liquidatable", [a]),
+        num(TGEN, "balance_of", [a]),
+        num(TUSDC, "balance_of", [a]),
+      ]);
+    // These two depend on the collateral amount, so they follow — but together.
     if (collateral !== "0") {
       const c = BigInt(collateral);
-      collateralValue = await num(LENDING, "live_collateral_value", [c]);
-      recognizedValue = await num(LENDING, "recognized_collateral_value", [c]);
+      [collateralValue, recognizedValue] = await Promise.all([
+        num(LENDING, "live_collateral_value", [c]),
+        num(LENDING, "recognized_collateral_value", [c]),
+      ]);
     }
   }
 
