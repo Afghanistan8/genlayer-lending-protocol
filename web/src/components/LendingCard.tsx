@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useAccount } from "wagmi";
 import { ConnectButton } from "@rainbow-me/rainbowkit";
 import { TransactionStatus } from "genlayer-js/types";
@@ -41,8 +41,6 @@ type State = {
   liqPending: boolean;
   quoteRef: string;
   quoteRecognized: string;
-  reserveA: string;
-  reserveB: string;
   errors: string[];
 };
 
@@ -62,16 +60,57 @@ export default function LendingCard() {
     setLog((l) => [{ text, kind }, ...l].slice(0, 8));
   }, []);
 
+  // studionet throttles at 30 reads/min. When a load is throttled the server
+  // serves its last known-good snapshot, but a cold instance may still hand back
+  // blanks — so the client also refuses to overwrite a good ruling with an empty
+  // payload and retries with backoff instead of freezing on "reading…".
+  const retryRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const attemptRef = useRef(0);
+  const BACKOFF_MS = [3000, 6000, 12000];
+
   const refresh = useCallback(async () => {
+    if (retryRef.current) {
+      clearTimeout(retryRef.current);
+      retryRef.current = null;
+    }
     setLoading(true);
+    const scheduleRetry = () => {
+      const i = Math.min(attemptRef.current, BACKOFF_MS.length - 1);
+      const delay = BACKOFF_MS[i];
+      attemptRef.current += 1;
+      retryRef.current = setTimeout(() => void refresh(), delay);
+      return delay;
+    };
     try {
       const q = address ? `?address=${address}` : "";
       const r = await fetch(`/api/state${q}`, { cache: "no-store" });
       const j = (await r.json()) as State;
-      setState(j);
-      if (j.errors?.length) say(`read issues: ${j.errors[0]}`, "err");
+      const hasRuling = !!j.riskTier || (j.riskEpoch ?? "0") !== "0";
+      const throttled = (j.errors?.length ?? 0) > 0;
+
+      setState((prev) => {
+        const prevHadRuling = !!prev && (!!prev.riskTier || (prev.riskEpoch ?? "0") !== "0");
+        // Never replace a real ruling with a blank, throttled payload.
+        if (!hasRuling && prevHadRuling) return prev;
+        return j;
+      });
+
+      if (throttled || !hasRuling) {
+        const delay = scheduleRetry();
+        if (attemptRef.current === 1) {
+          say(
+            throttled
+              ? `reads throttled by studionet — retrying in ${delay / 1000}s`
+              : `waiting for contract state — retrying in ${delay / 1000}s`,
+            "err"
+          );
+        }
+      } else {
+        attemptRef.current = 0;
+      }
     } catch (e) {
       say(`could not load state: ${(e as Error).message}`, "err");
+      scheduleRetry();
     } finally {
       setLoading(false);
     }
@@ -79,6 +118,9 @@ export default function LendingCard() {
 
   useEffect(() => {
     void refresh();
+    return () => {
+      if (retryRef.current) clearTimeout(retryRef.current);
+    };
   }, [refresh]);
 
   const write = useCallback(
@@ -138,6 +180,10 @@ export default function LendingCard() {
   const assessed = (state?.riskEpoch ?? "0") !== "0";
   const haircutPct = Number(state?.riskHaircutBps ?? "0") / 100;
 
+  const readErrors = state?.errors ?? [];
+  const throttled = readErrors.some((e) => /rate limit|30 requests|too many/i.test(e));
+  const showingData = !!tier || assessed;
+
   const rawV = Number(state?.collateralValue ?? "0");
   const recV = Number(state?.recognizedValue ?? "0");
   const debtN = Number(state?.debt ?? "0");
@@ -163,11 +209,22 @@ export default function LendingCard() {
         <ConnectButton showBalance={false} chainStatus="none" />
       </header>
 
-      {state?.errors && state.errors.length > 0 && (
+      {readErrors.length > 0 && (
         <p className="readerr">
-          <b>Live reads are failing.</b> Values below may be stale or blank —
-          check the contract address and RPC. First error:{" "}
-          <span className="mono small">{state.errors[0]}</span>
+          {throttled ? (
+            <>
+              <b>studionet is throttling reads (30/min).</b>{" "}
+              {showingData
+                ? "Showing the last confirmed values — refreshing automatically."
+                : "Values will appear once the limit clears — retrying automatically."}
+            </>
+          ) : (
+            <>
+              <b>Live reads are failing.</b> Values below may be stale or blank —
+              check the contract address and RPC. First error:{" "}
+              <span className="mono small">{readErrors[0]}</span>
+            </>
+          )}
         </p>
       )}
 
