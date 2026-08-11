@@ -21,7 +21,7 @@ and ruled that conditions are stressed. That ruling isn't advisory — `borrow()
 and `liquidate()` refuse to execute until the committee has spoken.
 
 - **Live app:** https://genlayer-lending-protocol.vercel.app
-- **Contract:** `0xC79dD0D2e1e557269922Ff4D1A18F730740f136f` (studionet, chain 61999)
+- **Contract:** `0x8c9A1C8382ef0477d229a21530546104D51fc319` (studionet, chain 61999)
 - **Stack:** Python Intelligent Contracts · Next.js + genlayer-js frontend
 
 ---
@@ -330,14 +330,15 @@ On Vercel, set the Root Directory to `web`.
 
 | contract | address |
 |---|---|
-| LendingProtocol (v6 live; replace with the v7 address after redeploy) | `0xC79dD0D2e1e557269922Ff4D1A18F730740f136f` |
+| LendingProtocol (v7 — live web+LLM risk committee) | `0x8c9A1C8382ef0477d229a21530546104D51fc319` |
 | AMM pool (tGEN/tUSDC, 30bps) | `0x6A732A632972fC3cF8a76b3CfeE3356C549c761C` |
 | tGEN | `0xd978F743Ce2Bad27c00A329F44f8F16b401F556C` |
 | tUSDC | `0xa04E4F945d941eD491C194E2BD29A4da06c37f07` |
 
-The lending address above is the v6 deployment. v7 (live web fetch) is a code
-change awaiting the owner's redeploy; once deployed, paste the new address into
-both this table and `web/src/config/contracts.ts`.
+The lending address above is the v7 deployment: each validator fetches the live
+Fear &amp; Greed index via `gl.nondet.web` inside the equivalence block and the
+committee settles the verdict on-chain. The previous v6 deployment
+(`0xC79d…136f`) judged on-chain facts only.
 
 Earlier milestones remain on-chain: `0xF87A…bb44` (read-only spike),
 `0x41Aa…C656` (before liquidation), `0x604A…7eDE` (before the risk committee).

@@ -5,9 +5,8 @@
 
 // LendingProtocol v7 — the risk committee now judges LIVE external sentiment
 // (crypto Fear & Greed index, fetched via gl.nondet.web inside the eq_principle
-// closure by each validator) alongside the on-chain evidence. Update this
-// address after the owner redeploys the v7 contract on studionet.
-export const LENDING = "0xC79dD0D2e1e557269922Ff4D1A18F730740f136f";
+// closure by each validator) alongside the on-chain evidence.
+export const LENDING = "0x8c9A1C8382ef0477d229a21530546104D51fc319";
 
 /** Collateral token (tGEN). */
 export const TGEN = "0xd978F743Ce2Bad27c00A329F44f8F16b401F556C";
