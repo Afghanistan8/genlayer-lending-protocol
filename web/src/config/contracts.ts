@@ -3,7 +3,10 @@
 // The lending protocol and the DEX live in SEPARATE repos and deployments.
 // This file is the only link between them: addresses, nothing imported.
 
-/** LendingProtocol v6 — adds validator-settled risk assessment. */
+// LendingProtocol v7 — the risk committee now judges LIVE external sentiment
+// (crypto Fear & Greed index, fetched via gl.nondet.web inside the eq_principle
+// closure by each validator) alongside the on-chain evidence. Update this
+// address after the owner redeploys the v7 contract on studionet.
 export const LENDING = "0xC79dD0D2e1e557269922Ff4D1A18F730740f136f";
 
 /** Collateral token (tGEN). */

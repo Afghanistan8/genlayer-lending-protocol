@@ -26,6 +26,8 @@ type State = {
   riskHaircutBps: string;
   riskEpoch: string;
   riskNote: string;
+  riskSignal: string;
+  pendingLiqId: string;
   collateral: string;
   debt: string;
   maxBorrow: string;
@@ -153,11 +155,21 @@ export default function LendingCard() {
           <p className="lede">
             Borrow tUSDC against tGEN. The price comes from an exchange deployed
             in a different repository — and how much of that price counts is
-            decided by GenLayer&rsquo;s validator committee, not by a formula.
+            decided by GenLayer&rsquo;s validator committee, which reads the{" "}
+            <em>live</em> crypto Fear &amp; Greed index and weighs it against the
+            on-chain evidence. Not a formula.
           </p>
         </div>
         <ConnectButton showBalance={false} chainStatus="none" />
       </header>
+
+      {state?.errors && state.errors.length > 0 && (
+        <p className="readerr">
+          <b>Live reads are failing.</b> Values below may be stale or blank —
+          check the contract address and RPC. First error:{" "}
+          <span className="mono small">{state.errors[0]}</span>
+        </p>
+      )}
 
       {/* ── The validator committee ── */}
       <section className={`verdict ${tier ? `t-${tier.toLowerCase()}` : ""}`}>
@@ -207,14 +219,25 @@ export default function LendingCard() {
       </section>
 
       <p className="explainer">
-        <b>How this works.</b> <code>assess_risk()</code> shows every validator
-        the same on-chain evidence — price, movement since the last ruling, pool
-        depth, protocol exposure — and asks each to judge, using its own model,
-        whether conditions are calm or stressed. They must reach consensus on one
-        verdict, and that verdict sets a haircut on every borrower&rsquo;s
-        collateral. It is not advice: <code>borrow()</code> and{" "}
-        <code>liquidate()</code> refuse to run until the committee has ruled.
+        <b>How this works.</b> <code>assess_risk()</code> asks every validator to
+        judge the market. Each one <em>independently fetches the live crypto Fear
+        &amp; Greed index</em> over the web from inside the consensus block, then
+        weighs that sentiment against the same on-chain evidence — price, movement
+        since the last ruling, pool depth, protocol exposure — using its own
+        model. They must reach consensus on one verdict, and that verdict sets a
+        haircut on every borrower&rsquo;s collateral. It is not advice:{" "}
+        <code>borrow()</code> and <code>liquidate()</code> refuse to run until the
+        committee has ruled.
       </p>
+
+      {state?.riskSignal && (
+        <p className="ruling">
+          <span className="protoLabel">
+            Committee&rsquo;s ruling — weighing the live Fear &amp; Greed feed
+          </span>
+          <span className="mono small">{state.riskSignal}</span>
+        </p>
+      )}
 
       {verdictDrivenLiquidation && (
         <p className="alarm">
@@ -415,7 +438,12 @@ export default function LendingCard() {
               disabled={!isConnected || busy !== null || !state?.liqPending}
               onClick={() =>
                 run("settle", [
-                  [LENDING, "settle_liquidation", [0n], "Settling proceeds"],
+                  [
+                    LENDING,
+                    "settle_liquidation",
+                    [BigInt(state?.pendingLiqId ?? "0")],
+                    "Settling proceeds",
+                  ],
                 ])
               }
             >

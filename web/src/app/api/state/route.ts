@@ -92,11 +92,14 @@ export async function GET(req: NextRequest) {
   const riskHaircutBps = await num(LENDING, "get_risk_haircut_bps");
   const riskEpoch = await num(LENDING, "get_risk_epoch");
   const riskNote = await str(LENDING, "get_risk_note");
+  // The committee's ruling — cites the LIVE Fear & Greed reading it judged.
+  const riskSignal = await str(LENDING, "get_risk_signal");
 
   // ---- protocol-wide ----
   const trackedLiquidity = await num(LENDING, "get_tracked_liquidity");
   const trackedCollateral = await num(LENDING, "get_tracked_collateral");
   const liqPending = await bool(LENDING, "get_liq_pending");
+  const pendingLiqId = await num(LENDING, "get_pending_liq_id");
   // Reference price at a fixed probe size: raw vs committee-recognized.
   const quoteRef = await num(LENDING, "live_collateral_value", [100n]);
   const quoteRecognized = await num(LENDING, "recognized_collateral_value", [100n]);
@@ -132,6 +135,8 @@ export async function GET(req: NextRequest) {
     riskHaircutBps,
     riskEpoch,
     riskNote,
+    riskSignal,
+    pendingLiqId,
     collateral,
     debt,
     maxBorrow,

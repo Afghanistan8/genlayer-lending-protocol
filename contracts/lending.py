@@ -1,13 +1,19 @@
 # { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
 
 """
-LendingProtocol v6 - collateralized lending whose credit limits and liquidation
+LendingProtocol v7 - collateralized lending whose credit limits and liquidation
 threshold are settled by the GenLayer validator committee.
 
 WHAT MAKES THIS A GENLAYER PROTOCOL (not a port of an EVM design):
-  assess_risk() runs a NON-DETERMINISTIC block. Validators are each shown the
-  same on-chain market facts and must independently judge market stress, then
-  reach consensus on ONE verdict: CALM / CAUTION / STRESS / CRISIS.
+  assess_risk() runs a NON-DETERMINISTIC block. Each validator independently
+  FETCHES A LIVE OFF-CHAIN SIGNAL - the crypto Fear & Greed index, over the web
+  from api.alternative.me - and judges it together with the same on-chain market
+  facts, then the committee reaches consensus on ONE verdict:
+  CALM / CAUTION / STRESS / CRISIS.
+  Because the external reading is live (it moves over time and between fetches)
+  and the judgement is subjective, the validators are settling a genuine
+  disagreement, not replaying identical inputs. This is meaningful GenLayer
+  consensus, and it is impossible to reproduce on a deterministic chain.
   That verdict is CONSEQUENTIAL - it sets a collateral haircut which is applied
   to EVERY credit decision in the contract:
       - how much you may borrow          (max_borrow, borrow)
@@ -20,10 +26,13 @@ WHAT MAKES THIS A GENLAYER PROTOCOL (not a port of an EVM design):
   refuses to run until one exists.
 
 DISCIPLINE - where non-determinism is allowed to touch:
-  The committee returns a LABEL only. The haircut for each label is a fixed
-  table in deterministic Python, and all arithmetic (health factors, debt,
-  proceeds, settlement) is ordinary deterministic code. The LLM decides POLICY;
-  it never produces a number that has to reconcile.
+  The web fetch and LLM judgement happen ONLY inside the closure passed to
+  gl.eq_principle.prompt_non_comparative. The committee returns a LABEL only.
+  The haircut for each label is a fixed table in deterministic Python, and all
+  arithmetic (health factors, debt, proceeds, settlement) is ordinary
+  deterministic code. Every storage write, cross-contract call and emit() runs
+  AFTER the non-deterministic block returns. The LLM decides POLICY; it never
+  produces a number that has to reconcile.
 
 Everything else is unchanged from v5 and remains the source of truth:
   - collateral tGEN, debt tUSDC; raw collateral valued by a live cross-contract
@@ -41,6 +50,55 @@ surplus refunds in any README/UI unless that code is added here first.
 """
 
 from genlayer import *
+
+import json
+
+
+# ================= LIVE EXTERNAL SENTIMENT (non-deterministic input) =========
+# These two module-level helpers gather the off-chain evidence the validator
+# committee judges. They are kept OUTSIDE the contract class on purpose: the
+# eq_principle closure in assess_risk() captures only a plain string plus these
+# module functions, so nothing about contract storage rides into the
+# non-deterministic block.
+def _parse_fear_greed(text: str) -> str:
+    """Pure parser for the alternative.me Fear & Greed payload.
+
+    Reads ONLY two fixed fields, range-checks the 0-100 score, and allowlists
+    the classification label - so no free-form text from the feed ever reaches
+    the LLM prompt (minimal prompt-injection surface). Returns 'unavailable' on
+    any malformed input. Pure (no web, no gl) so it is directly unit-testable.
+    """
+    try:
+        item = json.loads(text)["data"][0]
+        value = int(str(item["value"]).strip())
+        if value < 0 or value > 100:
+            return "unavailable"
+        label = str(item["value_classification"]).strip()
+        known = ("Extreme Fear", "Fear", "Neutral", "Greed", "Extreme Greed")
+        safe = label if label in known else "Unknown"
+        return "Fear & Greed index " + str(value) + "/100 (" + safe + ")"
+    except Exception:
+        return "unavailable"
+
+
+def _fetch_fear_greed() -> str:
+    """LIVE, NON-DETERMINISTIC external evidence: the crypto Fear & Greed index.
+
+    Only ever invoked from inside the assess_risk() eq_principle closure, where
+    EVERY validator fetches it independently - the value moves over time and
+    between fetches, which is exactly what makes the committee's agreement a
+    real consensus rather than a replay of identical inputs. A feed outage
+    degrades to 'unavailable' (the committee then judges on on-chain facts
+    alone) rather than bricking assess_risk().
+    """
+    try:
+        resp = gl.nondet.web.get("https://api.alternative.me/fng/?limit=1")
+        body = resp.body
+        if not body:
+            return "unavailable"
+        return _parse_fear_greed(bytes(body).decode("utf-8", errors="replace"))
+    except Exception:
+        return "unavailable"
 
 
 @gl.contract_interface
@@ -70,12 +128,13 @@ class LendingProtocol(gl.Contract):
     liq_pending: bool
     liq_user: TreeMap[u256, Address]
     liq_collateral: TreeMap[u256, u256]
-    liq_min_out: TreeMap[u256, u256]
+    liq_stage: u256                 # 1 transfer emitted, 2 swap emitted, 3 settled
     settled: TreeMap[u256, bool]
     # ---- validator-settled risk state ----
     risk_tier: str            # "" until first assessment
     risk_haircut_bps: u256    # applied to collateral value
-    risk_note: str            # committee's one-line rationale
+    risk_note: str            # deterministic on-chain evidence put to the committee
+    risk_signal: str          # committee's one-line ruling; cites the live feed it read
     risk_epoch: u256          # increments on every settled assessment
     risk_ref_price: u256      # quote observed at the last assessment
 
@@ -102,9 +161,11 @@ class LendingProtocol(gl.Contract):
         self.tracked_liquidity = 0
         self.next_liq_id = 0
         self.liq_pending = False
+        self.liq_stage = 0
         self.risk_tier = ""
         self.risk_haircut_bps = 0
         self.risk_note = ""
+        self.risk_signal = ""
         self.risk_epoch = 0
         self.risk_ref_price = 0
 
@@ -121,33 +182,47 @@ class LendingProtocol(gl.Contract):
 
     # ================= NON-DETERMINISTIC RISK ASSESSMENT =================
     # Permissionless. Anyone may ask the validator committee to re-judge market
-    # conditions. The facts shown to validators are gathered deterministically
-    # from on-chain state so every validator judges the SAME evidence; what they
-    # must agree on is the JUDGEMENT, which is inherently subjective.
+    # conditions. On-chain facts are gathered deterministically BEFORE the
+    # non-deterministic block (cross-contract calls are forbidden inside it).
+    # Inside the block, every validator independently fetches a LIVE off-chain
+    # signal - the crypto Fear & Greed index - and judges it alongside those
+    # facts. What they must agree on is the JUDGEMENT, which is subjective and
+    # rests on live external data, so the consensus is genuine.
     @gl.public.write
     def assess_risk(self) -> str:
-        facts = self._market_facts()
+        facts = self._market_facts()          # cross-contract views: BEFORE the nondet block
 
         def _judge() -> str:
-            return facts
+            # The ONLY non-deterministic step: a live web fetch, run
+            # independently by the leader and by every validator.
+            sentiment = _fetch_fear_greed()
+            return "LIVE MARKET SENTIMENT: " + sentiment + "\nON-CHAIN EVIDENCE: " + facts
 
         verdict = gl.eq_principle.prompt_non_comparative(
             _judge,
             task=(
-                "You are the risk committee of a lending protocol. From the "
-                "market report, classify current conditions for the collateral "
-                "asset. Answer with EXACTLY ONE word: CALM, CAUTION, STRESS or "
-                "CRISIS."
+                "You are the risk committee of a lending protocol. You are given "
+                "a LIVE crypto Fear & Greed sentiment reading (0 = extreme fear, "
+                "100 = extreme greed) and on-chain market facts for the "
+                "collateral asset. Weigh BOTH and classify current conditions. "
+                "Answer on a SINGLE line as: <TIER> - <one short sentence citing "
+                "the Fear & Greed number and the on-chain evidence>. TIER must be "
+                "exactly one of: CALM, CAUTION, STRESS, CRISIS."
             ),
             criteria=(
-                "CALM: price stable and liquidity deep relative to protocol "
-                "exposure. CAUTION: mild price decline or moderate borrowing "
-                "against available liquidity. STRESS: clear price decline, or "
-                "collateral large relative to pool depth so liquidating it "
-                "would move the price against the protocol. CRISIS: severe "
-                "price decline or collateral that dwarfs pool liquidity. "
-                "Judge conservatively: when the evidence is ambiguous choose "
-                "the safer, more cautious tier."
+                "Fear & Greed at or below ~25 (fear / extreme fear) signals a "
+                "fragile market and should push toward STRESS or CRISIS, "
+                "especially when collateral is large relative to pool depth or "
+                "price is falling. Around 45-55 is neutral. High greed (>75) is "
+                "NOT automatically calm - it can mask fragility, so do not relax "
+                "when on-chain depth is thin. CALM: stable price, deep liquidity, "
+                "non-extreme sentiment. CAUTION: mild price decline, moderate "
+                "borrowing, or sentiment drifting fearful. STRESS: clear price "
+                "decline, collateral large vs pool depth, or fearful sentiment. "
+                "CRISIS: severe price decline, collateral dwarfing liquidity, or "
+                "extreme-fear sentiment. If the sentiment reading is "
+                "'unavailable', judge on the on-chain facts alone. When the "
+                "evidence is ambiguous choose the safer, more cautious tier."
             ),
         )
 
@@ -166,7 +241,8 @@ class LendingProtocol(gl.Contract):
 
         self.risk_tier = tier
         self.risk_haircut_bps = haircut
-        self.risk_note = facts
+        self.risk_note = facts        # deterministic on-chain evidence
+        self.risk_signal = verdict    # committee's ruling, cites the live sentiment it read
         self.risk_epoch = self.risk_epoch + u256(1)
         self.risk_ref_price = Pool(self.trusted_pool).view().quote_a_for_b(self.PRICE_PROBE)
         return tier
@@ -197,8 +273,16 @@ class LendingProtocol(gl.Contract):
 
     def _normalize_tier(self, verdict: str) -> str:
         v = verdict.strip().upper()
-        # Order matters: check the most severe first so a longer answer that
-        # mentions several tiers resolves to the most cautious one.
+        # The committee is asked to LEAD with the tier word, so trust the first
+        # token: it avoids mis-reading a rationale that merely mentions another
+        # tier (e.g. "CALM - no CRISIS-level thinness").
+        head = v.replace("—", " ").replace("-", " ").split()
+        if head:
+            for t in ("CRISIS", "STRESS", "CAUTION", "CALM"):
+                if head[0] == t:
+                    return t
+        # Fallback: severity-first scan so a longer answer that mentions several
+        # tiers still resolves to the most cautious one.
         if "CRISIS" in v:
             return "CRISIS"
         if "STRESS" in v:
@@ -208,7 +292,7 @@ class LendingProtocol(gl.Contract):
         if "CALM" in v:
             return "CALM"
         # Unreadable answer must never silently become "safe".
-        raise Exception("risk committee returned an unusable verdict")
+        raise gl.vm.UserError("risk committee returned an unusable verdict")
 
     # ---------------- views ----------------
     @gl.public.view
@@ -222,6 +306,10 @@ class LendingProtocol(gl.Contract):
     @gl.public.view
     def get_risk_note(self) -> str:
         return self.risk_note
+
+    @gl.public.view
+    def get_risk_signal(self) -> str:
+        return self.risk_signal
 
     @gl.public.view
     def get_risk_epoch(self) -> u256:
@@ -352,6 +440,20 @@ class LendingProtocol(gl.Contract):
         return remaining
 
     # ================= liquidation saga (risk-gated) =================
+    # DESIGN NOTE — why this is a step-at-a-time saga:
+    #   GenLayer cross-contract writes are ASYNCHRONOUS messages. Two messages
+    #   emitted from the same transaction are NOT guaranteed to execute in the
+    #   order they were emitted. An earlier version emitted the collateral
+    #   transfer and the swap together; the swap ran first, failed the pool's
+    #   "token_a not received" check, and the collateral was left sitting at the
+    #   pool while the debt stayed open.
+    #   So this version emits exactly ONE message per transaction and VERIFIES
+    #   its effect on-chain before emitting the next. advance_liquidation() is
+    #   permissionless, idempotent per stage, and RETRIES a swap that did not
+    #   take effect — so a failed leg is recoverable rather than terminal.
+    #
+    # Stages:  1 = collateral transfer emitted   2 = swap emitted   3 = settled
+
     @gl.public.write
     def liquidate(self, user: Address) -> u256:
         assert not self.liq_pending, "another liquidation is pending settlement"
@@ -368,38 +470,95 @@ class LendingProtocol(gl.Contract):
         recognized = (raw_quote * (u256(10000) - self.risk_haircut_bps)) // u256(10000)
         assert debt * u256(10000) > recognized * self.liquidation_bps, "position is healthy at the current risk tier"
 
-        # Slippage guard is set against the RAW quote, because that is what the
-        # pool will actually pay; the haircut governs solvency policy, not
-        # execution price.
-        min_out = (raw_quote * u256(97)) // u256(100)
         liq_id = self.next_liq_id
         self.next_liq_id = liq_id + u256(1)
         self.liq_user[liq_id] = user
         self.liq_collateral[liq_id] = collat
-        self.liq_min_out[liq_id] = min_out
+        self.liq_stage = u256(1)
         self.liq_pending = True
 
         self.collateral_of[user] = u256(0)
         self.tracked_collateral = self.tracked_collateral - collat
 
+        # ONE message only. The swap is emitted later, once this has landed.
         gl.get_contract_at(self.collateral_token).emit().transfer(self.trusted_pool, collat)
-        Pool(self.trusted_pool).emit().swap_a_for_b(collat, min_out, self.address)
         return liq_id
 
-    @gl.public.write
-    def settle_liquidation(self, liq_id: u256) -> u256:
+    def _pool_unbooked_collateral(self) -> u256:
+        """Collateral sitting at the pool that the pool has not yet booked into
+        its reserves — i.e. our transfer landed but no swap consumed it."""
+        held = gl.get_contract_at(self.collateral_token).view().balance_of(self.trusted_pool)
+        booked = Pool(self.trusted_pool).view().get_reserve_a()
+        if held <= booked:
+            return u256(0)
+        return held - booked
+
+    def _advance(self, liq_id: u256) -> u256:
         assert self.liq_pending, "no liquidation pending"
         assert not self.settled.get(liq_id, False), "already settled"
-        user = self.liq_user.get(liq_id, Address(b"\x00" * 20))
+        assert liq_id + u256(1) == self.next_liq_id, "not the pending liquidation id"
+        collat = self.liq_collateral.get(liq_id, u256(0))
 
+        # ---- stage 1: the collateral transfer must have landed at the pool ----
+        if self.liq_stage == u256(1):
+            unbooked = self._pool_unbooked_collateral()
+            assert unbooked >= collat, "collateral has not reached the pool yet"
+            self._emit_swap(collat)
+            self.liq_stage = u256(2)
+            return u256(0)
+
+        # ---- stage 2: wait for proceeds; retry the swap if it did not take ----
         proceeds = gl.get_contract_at(self.debt_token).view().balance_of(self.address) - self.tracked_liquidity
-        assert proceeds > u256(0), "proceeds not arrived yet - swap not finalized"
+        if proceeds == u256(0):
+            # No proceeds. If the collateral is still sitting unbooked at the
+            # pool, the swap did not take effect - emit it again.
+            unbooked = self._pool_unbooked_collateral()
+            assert unbooked >= collat, "swap has not settled yet - try again shortly"
+            self._emit_swap(collat)
+            return u256(0)
 
+        user = self.liq_user.get(liq_id, Address(b"\x00" * 20))
         debt = self.debt_of.get(user, u256(0))
         repaid = proceeds if proceeds < debt else debt
         self.debt_of[user] = debt - repaid
+        # ALL proceeds (including any surplus beyond the debt) are retained as
+        # protocol liquidity; surplus is not refunded in this version.
         self.tracked_liquidity = self.tracked_liquidity + proceeds
-
         self.settled[liq_id] = True
+        self.liq_stage = u256(3)
         self.liq_pending = False
         return repaid
+
+    def _emit_swap(self, collat: u256) -> None:
+        # min_out is recomputed from a FRESH quote each time. Storing it at
+        # trigger time would let a stale figure make the swap permanently
+        # unfillable after the price moves.
+        quote = Pool(self.trusted_pool).view().quote_a_for_b(collat)
+        min_out = (quote * u256(97)) // u256(100)
+        Pool(self.trusted_pool).emit().swap_a_for_b(collat, min_out, self.address)
+
+    @gl.public.write
+    def advance_liquidation(self, liq_id: u256) -> u256:
+        """Permissionless driver. Call repeatedly until it returns the repaid
+        amount: it emits the swap once the collateral has arrived, retries a
+        swap that did not take effect, and books the proceeds when they land."""
+        return self._advance(liq_id)
+
+    @gl.public.write
+    def settle_liquidation(self, liq_id: u256) -> u256:
+        """Kept as the name the app already calls; same self-healing driver."""
+        return self._advance(liq_id)
+
+    @gl.public.view
+    def get_liq_stage(self) -> u256:
+        return self.liq_stage
+
+    @gl.public.view
+    def get_pending_liq_id(self) -> u256:
+        """The id of the liquidation currently awaiting settlement, or 0 when
+        none is pending. The frontend's Settle/Advance buttons pass this so they
+        target the right saga past the first-ever liquidation (_advance asserts
+        liq_id + 1 == next_liq_id)."""
+        if not self.liq_pending:
+            return u256(0)
+        return self.next_liq_id - u256(1)

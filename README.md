@@ -6,15 +6,19 @@ decided outside my own contract:
 1. **What your collateral is worth** — read live, on-chain, from an AMM pool
    deployed in a different repository as part of my DEX project.
 2. **How much of that value counts** — settled by GenLayer's validator
-   committee, which judges market conditions and applies a haircut that governs
+   committee, which reads a **live off-chain sentiment feed over the web** and
+   weighs it against the on-chain facts, then applies a haircut that governs
    every credit decision the protocol makes.
 
 The second one is the reason this is a GenLayer protocol rather than an EVM
-design that happens to be written in Python. A position here can be perfectly
-healthy at market price and still be liquidatable, because the validators looked
-at the evidence and ruled that conditions are stressed. That ruling isn't
-advisory — `borrow()` and `liquidate()` refuse to execute until the committee has
-spoken.
+design that happens to be written in Python. Each validator independently
+fetches the live crypto Fear &amp; Greed index from inside the consensus block
+and judges it — there is no single oracle, no cached price, and the input isn't
+identical across validators, so reaching one verdict is a genuine consensus
+problem, not arithmetic. A position here can be perfectly healthy at market
+price and still be liquidatable, because the committee looked at the evidence
+and ruled that conditions are stressed. That ruling isn't advisory — `borrow()`
+and `liquidate()` refuse to execute until the committee has spoken.
 
 - **Live app:** https://genlayer-lending-protocol.vercel.app
 - **Contract:** `0xC79dD0D2e1e557269922Ff4D1A18F730740f136f` (studionet, chain 61999)
@@ -28,8 +32,14 @@ An earlier version of this project was rejected with a fair criticism: the
 contract was fully deterministic, so nothing in it required meaningful GenLayer
 consensus. Everything it did could have run on any chain.
 
-This version adds a non-deterministic flow whose result is consequential, and
-wires it through every credit decision in the protocol. The section below is
+The earlier fix was close but not enough: it ran a validator vote, but the only
+thing the validators judged was on-chain data every one of them read identically,
+so consensus was still trivial. This version closes that gap. Each validator now
+**independently fetches a live off-chain signal — the crypto Fear &amp; Greed
+index — over the web** from inside the equivalence block, then judges it together
+with the on-chain facts. The input is genuinely non-deterministic across
+validators, the verdict they settle on is subjective, and it is consequential:
+it is wired through every credit decision in the protocol. The section below is
 that flow. The rest of the protocol — cross-contract pricing, push custody, the
 asynchronous liquidation saga — is unchanged and still described honestly further
 down.
@@ -41,17 +51,23 @@ down.
 `assess_risk()` is permissionless. Anyone can ask the committee to re-judge the
 market. Here is what happens:
 
-**1. The protocol gathers evidence deterministically.** Current collateral price
-from the pool, movement since the last ruling, pool depth on both sides, and how
-much collateral and lendable liquidity the protocol itself holds. Every validator
-is shown the *same* facts, so what they're being asked to agree on is the
-judgement, not the data.
+**1. The protocol gathers on-chain evidence deterministically.** Current
+collateral price from the pool, movement since the last ruling, pool depth on
+both sides, and how much collateral and lendable liquidity the protocol itself
+holds. These cross-contract reads happen *before* the consensus block, because
+GenLayer forbids cross-contract calls inside it.
 
-**2. Each validator judges independently, using its own model.** The question is
-deliberately subjective: are conditions `CALM`, `CAUTION`, `STRESS`, or `CRISIS`?
-The criteria talk about whether liquidity is deep enough to absorb the
-protocol's collateral, whether price is falling, and how exposure compares to
-pool depth — the kind of assessment a risk officer makes, not a formula.
+**2. Each validator independently fetches the live sentiment feed and judges.**
+From inside the equivalence block, every validator calls
+`gl.nondet.web.get("https://api.alternative.me/fng/?limit=1")` itself — a
+keyless, live crypto Fear &amp; Greed reading (0 = extreme fear, 100 = extreme
+greed) — and weighs that sentiment against the on-chain facts using its own
+model. The question is deliberately subjective: are conditions `CALM`, `CAUTION`,
+`STRESS`, or `CRISIS`? Because the feed is live and each validator fetches it
+independently, they are *not* guaranteed identical input — settling on one
+verdict is real consensus over non-deterministic data, the kind of assessment a
+risk officer makes, not a formula. If the feed is unreachable the fetch degrades
+to `unavailable` and the committee judges on the on-chain facts alone.
 
 **3. The committee settles on one verdict**, and the protocol converts it to a
 haircut through a fixed table:
@@ -71,8 +87,11 @@ without the price moving at all.
 
 ### Where non-determinism is allowed to touch
 
-The committee returns **a label and nothing else**. The haircut for each label is
-a fixed table in deterministic Python, and every number in the protocol — health
+The committee returns **one line: a tier and a short reason citing the numbers it
+read**. Only the tier is consumed by logic — a deterministic parser extracts it
+and refuses to continue if it can't (it never defaults to "safe"), and the
+haircut for each tier is a fixed table in deterministic Python. The reason string
+is displayed, never computed against. Every number in the protocol — health
 factors, debt, LTV arithmetic, liquidation proceeds, settlement — is ordinary
 deterministic code. The validators decide *policy*; they never produce a figure
 that has to reconcile. That separation is what keeps an LLM in the loop from
@@ -80,7 +99,11 @@ becoming an accounting hazard.
 
 ### Proof that the ruling is consequential
 
-Two on-chain results, both verifiable.
+Two on-chain results, both verifiable. Both were produced by the **v6**
+deployment — the version that already ran the validator vote but judged on-chain
+facts only. They prove the *wiring* is consequential (a split vote, and a verdict
+that flips liquidation); v7 changes only the input the committee reads, adding the
+live web fetch, and will be re-proven on redeploy (see [Running it](#running-it)).
 
 **The committee genuinely disagreed.** Transaction
 `0x8e443994be618f4000657dc810c8db9330a0465c01dc4894028a919ea5e823ce`:
@@ -145,33 +168,36 @@ runs in a later consensus round and returns nothing. So `borrow()` and
 `withdraw()` record the state change immediately and send tokens via
 `emit().transfer(...)` — **your debt exists before your money does.**
 
-### Liquidation is a three-transaction saga
+### Liquidation is a driven multi-transaction saga
 
 Because the swap can only be queued, an Aave-style atomic liquidation is
-impossible here:
+impossible here. The contract emits exactly **one** message per transaction and
+verifies its effect on-chain before emitting the next, so no leg is ever assumed:
 
 ```
 Tx 1   liquidate(user)
        ├─ confirms the position is underwater at RECOGNIZED value
        ├─ seizes the borrower's entire collateral
-       ├─ emit() → transfer the collateral to the pool
+       └─ emit() → transfer the collateral to the pool
+                   (ONE message only — the swap is not emitted yet)
+
+Tx 2   advance_liquidation(liq_id)   ── aliased settle_liquidation(liq_id)
+       ├─ asserts the collateral actually reached the pool (unbooked ≥ seized)
        └─ emit() → swap it, proceeds addressed back to me
-                   (returns nothing — no proceeds in this transaction)
 
-Tx 2   the pool's own consensus round
-       └─ the swap executes and sends tUSDC to my contract
-
-Tx 3   settle_liquidation(liq_id)
-       ├─ books the tUSDC balance increase as the proceeds
-       ├─ repays the borrower's debt
-       └─ marks the id settled, releases the lock
+Tx 3   advance_liquidation(liq_id)   ── call again
+       ├─ if proceeds landed: book them, repay the debt, release the lock
+       └─ if not: re-emit the swap if the collateral is still unbooked,
+                  else assert "not settled yet" and be retried
 ```
 
-Settlement is a **permissionless reconcile, not a callback**. A callback would
-have meant editing the DEX repo to teach it about a protocol it shouldn't know
-exists — and the decoupling is the point. So the contract measures its own
-balance delta instead. The DEX repo contains zero lines about lending and I never
-touched it.
+`advance_liquidation()` is permissionless, idempotent per stage, and re-emits a
+swap that didn't take effect — so a stalled leg is recoverable by calling again,
+not terminal. Settlement is a **permissionless reconcile, not a callback**. A
+callback would have meant editing the DEX repo to teach it about a protocol it
+shouldn't know exists — and the decoupling is the point. So the contract measures
+its own balance delta instead. The DEX repo contains zero lines about lending and
+I never touched it.
 
 The slippage guard (3%) is set against the **raw** quote, because that's what the
 pool will actually pay. The haircut governs solvency policy, not execution price.
@@ -180,8 +206,9 @@ pool will actually pay. The haircut governs solvency policy, not execution price
 
 | method | type | what it does |
 |---|---|---|
-| `assess_risk()` | write | **non-deterministic** — validator committee settles a market verdict and sets the haircut |
-| `get_risk_tier` / `get_risk_haircut_bps` / `get_risk_epoch` / `get_risk_note` | view | the current ruling, its cost, how many rulings have settled, and the evidence they judged |
+| `assess_risk()` | write | **non-deterministic** — each validator fetches the live Fear &amp; Greed index over the web and judges it with on-chain facts; the committee settles one verdict and sets the haircut |
+| `get_risk_tier` / `get_risk_haircut_bps` / `get_risk_epoch` / `get_risk_note` | view | the current ruling, its cost, how many rulings have settled, and the on-chain evidence they judged |
+| `get_risk_signal` | view | the committee's one-line ruling, citing the live Fear &amp; Greed reading it judged |
 | `live_collateral_value(amount)` | view | raw market value, cross-contract from the pool |
 | `recognized_collateral_value(amount)` | view | market value after the committee's haircut |
 | `max_borrow(user)` | view | 75% of recognized value, minus existing debt |
@@ -189,13 +216,14 @@ pool will actually pay. The haircut governs solvency policy, not execution price
 | `get_collateral` / `get_debt` | view | per-user position |
 | `get_tracked_collateral` / `get_tracked_liquidity` | view | protocol-wide booked balances |
 | `get_liq_pending` | view | whether a liquidation awaits settlement |
+| `get_pending_liq_id` | view | the id of the pending liquidation (0 when none) — the frontend settles against this |
 | `fund(amount)` | write | books transferred tUSDC as lendable liquidity (permissionless) |
 | `supply(amount)` | write | books transferred tGEN as collateral |
 | `borrow(amount)` | write | **requires a ruling**; records debt, emits payout, enforces LTV on recognized value |
 | `repay(amount)` | write | books transferred tUSDC against your debt |
 | `withdraw(amount)` | write | emits collateral back; re-checks LTV on recognized value |
-| `liquidate(user)` | write | **requires a ruling**; permissionless; seizes collateral, emits transfer + swap |
-| `settle_liquidation(liq_id)` | write | permissionless; books proceeds, clears debt — idempotent |
+| `liquidate(user)` | write | **requires a ruling**; permissionless; seizes collateral, emits the transfer (the swap follows in `advance_liquidation`) |
+| `advance_liquidation(liq_id)` / `settle_liquidation(liq_id)` | write | permissionless driver (same function, two names); emits the swap once collateral lands, retries a stalled swap, books proceeds, clears debt — idempotent per stage |
 | `set_trusted_dex` / `set_trusted_pool` | write | owner-only; repoint at redeployed contracts |
 
 ### Risk parameters, as deployed
@@ -215,9 +243,11 @@ pool will actually pay. The haircut governs solvency policy, not execution price
 - **Full-position liquidations only.** No partial liquidations.
 - **Surplus is not refunded.** If collateral sells for more than the debt, the
   excess stays with the protocol.
-- **No web access.** The committee judges on-chain evidence and its own knowledge.
-  It does not fetch news or off-chain price feeds. Adding `gl.nondet.web` to the
-  evidence gathering is the obvious next step and is not claimed here.
+- **One live signal, and only into policy.** The committee fetches the Fear &amp;
+  Greed index and nothing else — no news, no headlines, no off-chain price feed —
+  and it can only move the haircut tier, never a figure the accounting relies on.
+  If the feed is unreachable the fetch degrades to `unavailable` and the committee
+  rules on the on-chain facts alone.
 - **The aggregator address is recorded but never called.** `trusted_dex` is stored
   and owner-updatable, but no method reads it. All pricing and execution go
   through the pool directly.
@@ -250,8 +280,16 @@ own guard** — consensus accepted the transaction, the assert fired, no state
 changed — and the retry settled it: debt **0**, collateral **0**, protocol
 liquidity **56**, lock released.
 
-**M4 — the validator committee.** Covered above: three consensus rounds, a split
-vote, and a position that became liquidatable on the ruling alone.
+**M4 — the validator committee (v6).** Covered above: three consensus rounds, a
+split vote, and a position that became liquidatable on the ruling alone — proving
+the verdict is consequential end-to-end.
+
+**M5 — live external sentiment (v7).** The committee now fetches the crypto Fear
+&amp; Greed index over the web from inside the equivalence block, so each
+validator judges genuinely non-deterministic input. Once the owner redeploys v7
+(see below) and calls `assess_risk()`, `get_risk_signal()` returns the committee's
+one-line ruling citing the live reading, and the app renders it. That fetch is the
+material non-determinism the earlier review asked for.
 
 Every flow in the frontend has been exercised against studionet: assess, supply,
 borrow, repay, withdraw, fund, liquidate and settle.
@@ -292,10 +330,14 @@ On Vercel, set the Root Directory to `web`.
 
 | contract | address |
 |---|---|
-| LendingProtocol (current) | `0xC79dD0D2e1e557269922Ff4D1A18F730740f136f` |
+| LendingProtocol (v6 live; replace with the v7 address after redeploy) | `0xC79dD0D2e1e557269922Ff4D1A18F730740f136f` |
 | AMM pool (tGEN/tUSDC, 30bps) | `0x6A732A632972fC3cF8a76b3CfeE3356C549c761C` |
 | tGEN | `0xd978F743Ce2Bad27c00A329F44f8F16b401F556C` |
 | tUSDC | `0xa04E4F945d941eD491C194E2BD29A4da06c37f07` |
+
+The lending address above is the v6 deployment. v7 (live web fetch) is a code
+change awaiting the owner's redeploy; once deployed, paste the new address into
+both this table and `web/src/config/contracts.ts`.
 
 Earlier milestones remain on-chain: `0xF87A…bb44` (read-only spike),
 `0x41Aa…C656` (before liquidation), `0x604A…7eDE` (before the risk committee).
@@ -314,9 +356,15 @@ rulings. I'd rather report that than pretend the calibration is validated.
 `assess_risk()` again. There is no staleness expiry, so a position can sit under
 an old verdict.
 
-**Child message ordering.** `liquidate()` emits the transfer and the swap and
-assumes they execute in that order. If the swap ran first it would fail its own
-receipt check and the collateral would sit at the pool awaiting manual recovery.
+**Liquidation is a driven, self-healing saga.** `liquidate()` emits exactly one
+message — the collateral transfer — and then `advance_liquidation()` (aliased
+`settle_liquidation()`) is called repeatedly to move it forward: it emits the
+swap only after confirming the collateral actually reached the pool, re-emits a
+swap that didn't take effect, and books the proceeds when they land. Each stage
+verifies its own precondition on-chain, so a leg that hasn't settled yet asserts
+cleanly and is retried rather than corrupting state — but the saga does need
+someone to keep calling the driver until it returns the repaid amount. It does
+not self-trigger.
 
 **One liquidation at a time.** Settlement identifies proceeds by balance delta, so
 a global lock permits one pending liquidation. A `repay()` landing in that window
@@ -388,9 +436,9 @@ directory, not wherever you've `cd`'d.
 
 ## What's next
 
-- Feed real off-chain signals into the committee's evidence via `gl.nondet.web` —
-  volatility, headlines, reference prices — so the judgement covers the world
-  outside the pool.
+- Broaden the committee's live evidence beyond the Fear &amp; Greed index —
+  volatility, headlines, reference prices — so the judgement covers more of the
+  world outside the pool.
 - Expire stale rulings, so credit decisions can't run on an old verdict.
 - Interest accrual, partial liquidations, and a liquidator incentive.
 
