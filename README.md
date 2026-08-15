@@ -21,7 +21,7 @@ and ruled that conditions are stressed. That ruling isn't advisory — `borrow()
 and `liquidate()` refuse to execute until the committee has spoken.
 
 - **Live app:** https://genlayer-lending-protocol.vercel.app
-- **Contract:** `0x8c9A1C8382ef0477d229a21530546104D51fc319` (studionet, chain 61999)
+- **Contract:** `0xd46c828bDeB732cB1F3C1da9DEE61FA52eD74534` (studionet, chain 61999)
 - **Stack:** Python Intelligent Contracts · Next.js + genlayer-js frontend
 
 ---
@@ -215,6 +215,7 @@ pool will actually pay. The haircut governs solvency policy, not execution price
 | `is_liquidatable(user)` | view | true when debt exceeds 80% of recognized value |
 | `get_collateral` / `get_debt` | view | per-user position |
 | `get_tracked_collateral` / `get_tracked_liquidity` | view | protocol-wide booked balances |
+| `get_pending_collateral_out` / `get_pending_liquidity_out` | view | payouts emitted but not yet confirmed gone; excluded from deposit crediting |
 | `get_liq_pending` | view | whether a liquidation awaits settlement |
 | `get_pending_liq_id` | view | the id of the pending liquidation (0 when none) — the frontend settles against this |
 | `fund(amount)` | write | books transferred tUSDC as lendable liquidity (permissionless) |
@@ -330,7 +331,7 @@ On Vercel, set the Root Directory to `web`.
 
 | contract | address |
 |---|---|
-| LendingProtocol (v7 — live web+LLM risk committee) | `0x8c9A1C8382ef0477d229a21530546104D51fc319` |
+| LendingProtocol (v7 — live web+LLM risk committee) | `0xd46c828bDeB732cB1F3C1da9DEE61FA52eD74534` |
 | AMM pool (tGEN/tUSDC, 30bps) | `0x6A732A632972fC3cF8a76b3CfeE3356C549c761C` |
 | tGEN | `0xd978F743Ce2Bad27c00A329F44f8F16b401F556C` |
 | tUSDC | `0xa04E4F945d941eD491C194E2BD29A4da06c37f07` |
@@ -368,8 +369,18 @@ someone to keep calling the driver until it returns the repaid amount. It does
 not self-trigger.
 
 **One liquidation at a time.** Settlement identifies proceeds by balance delta, so
-a global lock permits one pending liquidation. A `repay()` landing in that window
-would be counted into the settlement.
+a global lock permits one pending liquidation. `repay()`/`fund()` refuse to run
+while a liquidation is awaiting its swap proceeds (`liq_stage == 2`), so those
+proceeds can never be counted as someone else's deposit.
+
+**Payout deltas are isolated from deposit deltas.** `borrow()`/`withdraw()`
+decrement `tracked_liquidity`/`tracked_collateral` the instant they emit a
+payout, but the async transfer settles later — until it does, the balance still
+sitting in the contract is earmarked in `pending_liquidity_out` /
+`pending_collateral_out` and excluded from what `supply()`/`fund()`/`repay()`
+will credit as a fresh deposit. Without this, an in-flight payout (or the same
+window race on liquidation proceeds above) could be double-counted and used to
+credit debt reduction or collateral to a caller who transferred nothing.
 
 **studionet simulates consensus.** The appeal window and message re-execution
 aren't exercised as a real network would. Settlement is idempotent regardless, but

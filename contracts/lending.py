@@ -40,7 +40,12 @@ Everything else is unchanged from v5 and remains the source of truth:
   - PUSH custody (transfer first, then supply()/repay()/fund(); receipt verified
     by balance delta). No approve/allowance exists.
   - borrow()/withdraw() pay out via async emit().transfer (tokens arrive after
-    the child message finalizes)
+    the child message finalizes). Until that transfer lands, the payout amount
+    is earmarked in pending_liquidity_out / pending_collateral_out and
+    excluded from the balance-delta check, so an outgoing payout in flight (or
+    unbooked liquidation swap proceeds) can never be mistaken for a fresh
+    deposit and credited to debt reduction or collateral without an actual
+    transfer. See _reconcile_liquidity()/_reconcile_collateral().
   - ZERO interest. No LP shares, no yield, no withdrawal of funded liquidity.
   - liquidation: full-position only, no liquidator bonus, 3% slippage guard,
     surplus retained as protocol liquidity, permissionless reconcile settlement,
@@ -123,6 +128,14 @@ class LendingProtocol(gl.Contract):
     debt_of: TreeMap[Address, u256]
     tracked_collateral: u256
     tracked_liquidity: u256
+    # ---- payouts promised but not yet confirmed gone (async emit in flight) ----
+    # borrow()/withdraw() decrement tracked_* the instant they emit a payout,
+    # but the child transfer settles later. Until it does, the balance-delta
+    # check in supply()/fund()/repay() would otherwise see that still-resident
+    # balance as a fresh, uncredited deposit. These counters earmark it so it
+    # can never be double-credited - see _reconcile_liquidity()/_reconcile_collateral().
+    pending_liquidity_out: u256
+    pending_collateral_out: u256
     # ---- liquidation saga ----
     next_liq_id: u256
     liq_pending: bool
@@ -159,6 +172,8 @@ class LendingProtocol(gl.Contract):
         self.liquidation_bps = liquidation_bps
         self.tracked_collateral = 0
         self.tracked_liquidity = 0
+        self.pending_liquidity_out = 0
+        self.pending_collateral_out = 0
         self.next_liq_id = 0
         self.liq_pending = False
         self.liq_stage = 0
@@ -332,6 +347,14 @@ class LendingProtocol(gl.Contract):
         return self.tracked_collateral
 
     @gl.public.view
+    def get_pending_liquidity_out(self) -> u256:
+        return self.pending_liquidity_out
+
+    @gl.public.view
+    def get_pending_collateral_out(self) -> u256:
+        return self.pending_collateral_out
+
+    @gl.public.view
     def get_liq_pending(self) -> bool:
         return self.liq_pending
 
@@ -371,10 +394,71 @@ class LendingProtocol(gl.Contract):
         value = self._recognized(self.collateral_of.get(user, u256(0)))
         return debt * u256(10000) > value * self.liquidation_bps
 
+    # ---------------- balance-delta isolation (payout + liquidation deltas) ----
+    # supply()/fund()/repay() credit a caller by comparing the token balance we
+    # actually hold against what we believe we're holding on their behalf
+    # (tracked_*). That comparison is only trustworthy if every OTHER reason the
+    # balance could have moved is subtracted out first:
+    #   - a borrow()/withdraw() payout that was already deducted from tracked_*
+    #     but whose async transfer has not yet left the contract
+    #     (pending_liquidity_out / pending_collateral_out)
+    #   - liquidation swap proceeds sitting unbooked between the swap landing
+    #     and advance_liquidation() claiming them (checked separately below)
+    # Without this, a pending payout or liquidation proceeds - money the
+    # contract is already obligated to move elsewhere - could be mistaken for a
+    # brand new deposit and used to credit debt reduction or collateral to
+    # someone who transferred nothing.
+    #
+    # "floor" = tracked_* + pending_*_out is the minimum balance we'd expect to
+    # still be holding if NONE of the earmarked payout has left yet. If the
+    # live balance is at or below that floor, the earmark is (partly) stale -
+    # some of that payout has already left - so we shrink it by exactly the
+    # shortfall. Only once the balance clears the floor is anything above it
+    # a genuine, creditable new deposit. This call always succeeds (a pure
+    # correction, never an assertion), so the shrink commits even when it
+    # runs as part of a caller's transaction that later reverts for an
+    # unrelated reason.
+    def _reconcile_liquidity(self) -> u256:
+        balance = gl.get_contract_at(self.debt_token).view().balance_of(self.address)
+        floor = self.tracked_liquidity + self.pending_liquidity_out
+        if balance <= floor:
+            shortfall = floor - balance
+            settled = shortfall if shortfall <= self.pending_liquidity_out else self.pending_liquidity_out
+            self.pending_liquidity_out = self.pending_liquidity_out - settled
+            return u256(0)
+        return balance - floor
+
+    def _reconcile_collateral(self) -> u256:
+        balance = gl.get_contract_at(self.collateral_token).view().balance_of(self.address)
+        floor = self.tracked_collateral + self.pending_collateral_out
+        if balance <= floor:
+            shortfall = floor - balance
+            settled = shortfall if shortfall <= self.pending_collateral_out else self.pending_collateral_out
+            self.pending_collateral_out = self.pending_collateral_out - settled
+            return u256(0)
+        return balance - floor
+
+    @gl.public.write
+    def reconcile_liquidity(self) -> u256:
+        """Permissionless: true up pending_liquidity_out against the debt
+        token's actual balance, in case an earlier payout has since landed.
+        Always succeeds. Callers racing a payout they triggered can call this
+        on its own before their next fund()/repay(), rather than have the
+        correction only attempted (and rolled back on failure) inside those."""
+        return self._reconcile_liquidity()
+
+    @gl.public.write
+    def reconcile_collateral(self) -> u256:
+        """Collateral-side counterpart to reconcile_liquidity()."""
+        return self._reconcile_collateral()
+
     # ---------------- liquidity provisioning (push) ----------------
     @gl.public.write
     def fund(self, amount: u256) -> u256:
-        received = gl.get_contract_at(self.debt_token).view().balance_of(self.address) - self.tracked_liquidity
+        assert not (self.liq_pending and self.liq_stage == u256(2)), (
+            "liquidation settlement pending: call advance_liquidation() first"
+        )
+        received = self._reconcile_liquidity()
         assert received >= amount, "tUSDC not received: transfer amount to this contract first"
         self.tracked_liquidity = self.tracked_liquidity + amount
         return self.tracked_liquidity
@@ -383,7 +467,7 @@ class LendingProtocol(gl.Contract):
     @gl.public.write
     def supply(self, amount: u256) -> u256:
         assert amount > u256(0), "amount must be positive"
-        received = gl.get_contract_at(self.collateral_token).view().balance_of(self.address) - self.tracked_collateral
+        received = self._reconcile_collateral()
         assert received >= amount, "tGEN not received: transfer amount to this contract first"
         user = gl.message.sender_address
         self.collateral_of[user] = self.collateral_of.get(user, u256(0)) + amount
@@ -398,12 +482,14 @@ class LendingProtocol(gl.Contract):
         user = gl.message.sender_address
         collat = self.collateral_of.get(user, u256(0))
         assert collat > u256(0), "no collateral supplied"
+        self._reconcile_liquidity()  # true up any prior payout that has since landed
         assert amount <= self.tracked_liquidity, "insufficient protocol liquidity"
         value = self._recognized(collat)          # committee-adjusted
         new_debt = self.debt_of.get(user, u256(0)) + amount
         assert new_debt * u256(10000) <= value * self.ltv_bps, "exceeds LTV limit at the current risk tier"
         self.debt_of[user] = new_debt
         self.tracked_liquidity = self.tracked_liquidity - amount
+        self.pending_liquidity_out = self.pending_liquidity_out + amount
         gl.get_contract_at(self.debt_token).emit().transfer(user, amount)
         return new_debt
 
@@ -411,11 +497,14 @@ class LendingProtocol(gl.Contract):
     @gl.public.write
     def repay(self, amount: u256) -> u256:
         assert amount > u256(0), "amount must be positive"
+        assert not (self.liq_pending and self.liq_stage == u256(2)), (
+            "liquidation settlement pending: call advance_liquidation() first"
+        )
         user = gl.message.sender_address
         debt = self.debt_of.get(user, u256(0))
         assert debt > u256(0), "no outstanding debt"
         assert amount <= debt, "amount exceeds outstanding debt"
-        received = gl.get_contract_at(self.debt_token).view().balance_of(self.address) - self.tracked_liquidity
+        received = self._reconcile_liquidity()
         assert received >= amount, "tUSDC not received: transfer amount to this contract first"
         self.debt_of[user] = debt - amount
         self.tracked_liquidity = self.tracked_liquidity + amount
@@ -428,6 +517,7 @@ class LendingProtocol(gl.Contract):
         user = gl.message.sender_address
         collat = self.collateral_of.get(user, u256(0))
         assert amount <= collat, "amount exceeds supplied collateral"
+        self._reconcile_collateral()  # true up any prior payout that has since landed
         remaining = collat - amount
         debt = self.debt_of.get(user, u256(0))
         if debt > u256(0):
@@ -436,6 +526,7 @@ class LendingProtocol(gl.Contract):
             assert debt * u256(10000) <= value * self.ltv_bps, "withdrawal would breach LTV at the current risk tier"
         self.collateral_of[user] = remaining
         self.tracked_collateral = self.tracked_collateral - amount
+        self.pending_collateral_out = self.pending_collateral_out + amount
         gl.get_contract_at(self.collateral_token).emit().transfer(user, amount)
         return remaining
 
@@ -477,8 +568,10 @@ class LendingProtocol(gl.Contract):
         self.liq_stage = u256(1)
         self.liq_pending = True
 
+        self._reconcile_collateral()  # true up any prior payout that has since landed
         self.collateral_of[user] = u256(0)
         self.tracked_collateral = self.tracked_collateral - collat
+        self.pending_collateral_out = self.pending_collateral_out + collat
 
         # ONE message only. The swap is emitted later, once this has landed.
         gl.get_contract_at(self.collateral_token).emit().transfer(self.trusted_pool, collat)
@@ -508,7 +601,10 @@ class LendingProtocol(gl.Contract):
             return u256(0)
 
         # ---- stage 2: wait for proceeds; retry the swap if it did not take ----
-        proceeds = gl.get_contract_at(self.debt_token).view().balance_of(self.address) - self.tracked_liquidity
+        # Isolated from any concurrently in-flight borrow() payout via the same
+        # reconciliation used by supply()/fund()/repay(), so a pending payout
+        # can never be double-booked as swap proceeds.
+        proceeds = self._reconcile_liquidity()
         if proceeds == u256(0):
             # No proceeds. If the collateral is still sitting unbooked at the
             # pool, the swap did not take effect - emit it again.
