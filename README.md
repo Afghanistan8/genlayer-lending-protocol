@@ -21,7 +21,7 @@ and ruled that conditions are stressed. That ruling isn't advisory — `borrow()
 and `liquidate()` refuse to execute until the committee has spoken.
 
 - **Live app:** https://genlayer-lending-protocol.vercel.app
-- **Contract:** `0xd46c828bDeB732cB1F3C1da9DEE61FA52eD74534` (studionet, chain 61999)
+- **Contract:** `0xDEA63B16f2e76beB68294fb325902E29944dAf1D` (studionet, chain 61999)
 - **Stack:** Python Intelligent Contracts · Next.js + genlayer-js frontend
 
 ---
@@ -195,9 +195,20 @@ Tx 3   advance_liquidation(liq_id)   ── call again
 swap that didn't take effect — so a stalled leg is recoverable by calling again,
 not terminal. Settlement is a **permissionless reconcile, not a callback**. A
 callback would have meant editing the DEX repo to teach it about a protocol it
-shouldn't know exists — and the decoupling is the point. So the contract measures
-its own balance delta instead. The DEX repo contains zero lines about lending and
-I never touched it.
+shouldn't know exists — and the decoupling is the point. The DEX repo contains
+zero lines about lending and I never touched it.
+
+The swap's proceeds are measured at the **pool's own reserve**, not our
+balance: right before emitting the swap, the contract snapshots the pool's
+debt-asset reserve, and stage 2 reads how far that reserve has drained since.
+That drain is exactly what the pool paid us for this swap, regardless of
+anything unrelated moving our own balance in the same window (a stray
+transfer, a queued `fund()`/`repay()` landing, an in-flight `borrow()`
+payout). Reading our own balance instead — the earlier design — couldn't tell
+"the swap's proceeds" apart from "someone else's tokens that happened to
+arrive at the same time," so unrelated funds could get counted as liquidation
+proceeds and extinguish more of the borrower's debt than the sale actually
+raised.
 
 The slippage guard (3%) is set against the **raw** quote, because that's what the
 pool will actually pay. The haircut governs solvency policy, not execution price.
@@ -216,12 +227,16 @@ pool will actually pay. The haircut governs solvency policy, not execution price
 | `get_collateral` / `get_debt` | view | per-user position |
 | `get_tracked_collateral` / `get_tracked_liquidity` | view | protocol-wide booked balances |
 | `get_pending_collateral_out` / `get_pending_liquidity_out` | view | payouts emitted but not yet confirmed gone; excluded from deposit crediting |
+| `get_supply_queue_depth` / `get_fund_queue_depth` / `get_repay_queue_depth` | view | registered-but-not-yet-settled credit tickets |
 | `get_liq_pending` | view | whether a liquidation awaits settlement |
 | `get_pending_liq_id` | view | the id of the pending liquidation (0 when none) — the frontend settles against this |
-| `fund(amount)` | write | books transferred tUSDC as lendable liquidity (permissionless) |
-| `supply(amount)` | write | books transferred tGEN as collateral |
+| `fund(amount)` | write | queues a credit ticket for the transferred tUSDC and drains the queue (permissionless) |
+| `settle_fund()` | write | permissionless: drains queued fund tickets without registering a new one |
+| `supply(amount)` | write | queues a credit ticket for the transferred tGEN, crediting collateral as the queue drains |
+| `settle_supply()` | write | permissionless: drains queued supply tickets without registering a new one |
 | `borrow(amount)` | write | **requires a ruling**; records debt, emits payout, enforces LTV on recognized value |
-| `repay(amount)` | write | books transferred tUSDC against your debt |
+| `repay(amount)` | write | queues a credit ticket for the transferred tUSDC, reducing debt as the queue drains |
+| `settle_repay()` | write | permissionless: drains queued repay tickets without registering a new one |
 | `withdraw(amount)` | write | emits collateral back; re-checks LTV on recognized value |
 | `liquidate(user)` | write | **requires a ruling**; permissionless; seizes collateral, emits the transfer (the swap follows in `advance_liquidation`) |
 | `advance_liquidation(liq_id)` / `settle_liquidation(liq_id)` | write | permissionless driver (same function, two names); emits the swap once collateral lands, retries a stalled swap, books proceeds, clears debt — idempotent per stage |
@@ -331,7 +346,7 @@ On Vercel, set the Root Directory to `web`.
 
 | contract | address |
 |---|---|
-| LendingProtocol (v7 — live web+LLM risk committee) | `0xd46c828bDeB732cB1F3C1da9DEE61FA52eD74534` |
+| LendingProtocol (v7 — live web+LLM risk committee) | `0xDEA63B16f2e76beB68294fb325902E29944dAf1D` |
 | AMM pool (tGEN/tUSDC, 30bps) | `0x6A732A632972fC3cF8a76b3CfeE3356C549c761C` |
 | tGEN | `0xd978F743Ce2Bad27c00A329F44f8F16b401F556C` |
 | tUSDC | `0xa04E4F945d941eD491C194E2BD29A4da06c37f07` |
@@ -381,6 +396,27 @@ sitting in the contract is earmarked in `pending_liquidity_out` /
 will credit as a fresh deposit. Without this, an in-flight payout (or the same
 window race on liquidation proceeds above) could be double-counted and used to
 credit debt reduction or collateral to a caller who transferred nothing.
+
+**Credits are bound to whoever registered them, not whoever calls.** A balance
+delta alone can't tell WHOSE transfer produced an increase — only that one
+happened — so any caller could sweep an already-arrived, not-yet-claimed
+transfer just by calling `supply()`/`fund()`/`repay()` first, with zero setup
+of their own. Each call instead queues a numbered ticket (registrant, amount);
+settlement (the same call, immediately, if nothing is queued ahead of it, or a
+later `settle_supply()`/`settle_fund()`/`settle_repay()`) drains the queue in
+registration order, crediting the ticket's owner only from excess that clears
+everyone queued ahead of it. This is **not** a cryptographic proof of who sent
+a specific transfer — that would need an allowance/`transferFrom` the deployed
+tGEN/tUSDC tokens don't implement (this protocol has none, by design, per the
+custody model above). It's a weaker but real guarantee: nothing queued *later*
+can cut in front of a ticket already waiting. A ticket registered before
+transferring is protected against a later-registering third party; a transfer
+made before anyone has registered anything is first-come-first-served among
+tickets that exist once it lands, the same way any shared pool is. `repay()`
+tickets cap the credited amount at the registrant's outstanding debt at
+settlement time (it may have shrunk via a liquidation in between) rather than
+leaving the ticket stuck. Each drain is capped at `MAX_DRAIN` (20) tickets per
+call so a long backlog can't make a single call run out of gas.
 
 **studionet simulates consensus.** The appeal window and message re-execution
 aren't exercised as a real network would. Settlement is idempotent regardless, but

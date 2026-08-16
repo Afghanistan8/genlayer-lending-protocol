@@ -37,8 +37,11 @@ DISCIPLINE - where non-determinism is allowed to touch:
 Everything else is unchanged from v5 and remains the source of truth:
   - collateral tGEN, debt tUSDC; raw collateral valued by a live cross-contract
     view() quote from the trusted Pool
-  - PUSH custody (transfer first, then supply()/repay()/fund(); receipt verified
-    by balance delta). No approve/allowance exists.
+  - PUSH custody (register a ticket via supply()/repay()/fund(), transfer the
+    tokens, then a settle_*() call - possibly the same supply()/repay()/fund()
+    call, if nothing is queued ahead of it - credits the ticket; receipt
+    verified by balance delta, see the credit-ticket note below). No
+    approve/allowance exists.
   - borrow()/withdraw() pay out via async emit().transfer (tokens arrive after
     the child message finalizes). Until that transfer lands, the payout amount
     is earmarked in pending_liquidity_out / pending_collateral_out and
@@ -46,6 +49,16 @@ Everything else is unchanged from v5 and remains the source of truth:
     unbooked liquidation swap proceeds) can never be mistaken for a fresh
     deposit and credited to debt reduction or collateral without an actual
     transfer. See _reconcile_liquidity()/_reconcile_collateral().
+  - supply()/fund()/repay() bind each credit to whoever REGISTERED it, not
+    whoever happens to call the function: each call queues a numbered ticket
+    (caller, amount), and settlement drains the queue in registration order,
+    crediting the ticket's owner only from excess that clears everyone queued
+    ahead of it. See _drain_supply()/_drain_fund()/_drain_repay().
+  - liquidation proceeds are measured at the pool's OWN reserve, not our
+    balance: the pool's debt-asset reserve draining by X is exactly what it
+    paid us for the swap, so a stray or queued transfer landing in the same
+    window can't inflate what gets booked as proceeds. See stage 2 of
+    _advance().
   - ZERO interest. No LP shares, no yield, no withdrawal of funded liquidity.
   - liquidation: full-position only, no liquidator bonus, 3% slippage guard,
     surplus retained as protocol liquidity, permissionless reconcile settlement,
@@ -136,6 +149,26 @@ class LendingProtocol(gl.Contract):
     # can never be double-credited - see _reconcile_liquidity()/_reconcile_collateral().
     pending_liquidity_out: u256
     pending_collateral_out: u256
+    # ---- credit tickets: bind each credit to whoever registered it ----
+    # A balance-delta check alone can't tell WHOSE transfer produced an
+    # increase - only that one happened - so any caller could claim someone
+    # else's already-arrived transfer just by calling supply()/fund()/repay()
+    # first. Each call queues a numbered ticket instead; settlement drains
+    # the queue in registration order, so a ticket can only be paid from
+    # excess that clears every ticket queued ahead of it. See
+    # _drain_supply()/_drain_fund()/_drain_repay().
+    next_supply_ticket: u256
+    supply_ticket_user: TreeMap[u256, Address]
+    supply_ticket_amount: TreeMap[u256, u256]
+    next_supply_settle: u256
+    next_fund_ticket: u256
+    fund_ticket_user: TreeMap[u256, Address]
+    fund_ticket_amount: TreeMap[u256, u256]
+    next_fund_settle: u256
+    next_repay_ticket: u256
+    repay_ticket_user: TreeMap[u256, Address]
+    repay_ticket_amount: TreeMap[u256, u256]
+    next_repay_settle: u256
     # ---- liquidation saga ----
     next_liq_id: u256
     liq_pending: bool
@@ -143,6 +176,9 @@ class LendingProtocol(gl.Contract):
     liq_collateral: TreeMap[u256, u256]
     liq_stage: u256                 # 1 transfer emitted, 2 swap emitted, 3 settled
     settled: TreeMap[u256, bool]
+    # pool's own debt-asset reserve right before each liquidation's swap, so
+    # the swap's exact output can be measured at the source. See _advance().
+    liq_reserve_b_before: TreeMap[u256, u256]
     # ---- validator-settled risk state ----
     risk_tier: str            # "" until first assessment
     risk_haircut_bps: u256    # applied to collateral value
@@ -153,6 +189,10 @@ class LendingProtocol(gl.Contract):
 
     # Reference size used to sample the pool price (raw units).
     PRICE_PROBE = u256(100)
+
+    # Max tickets drained per call to a settle_*()/supply()/fund()/repay()
+    # call, so a long backlog can't make a single call run out of gas.
+    MAX_DRAIN = u256(20)
 
     def __init__(
         self,
@@ -174,6 +214,12 @@ class LendingProtocol(gl.Contract):
         self.tracked_liquidity = 0
         self.pending_liquidity_out = 0
         self.pending_collateral_out = 0
+        self.next_supply_ticket = 0
+        self.next_supply_settle = 0
+        self.next_fund_ticket = 0
+        self.next_fund_settle = 0
+        self.next_repay_ticket = 0
+        self.next_repay_settle = 0
         self.next_liq_id = 0
         self.liq_pending = False
         self.liq_stage = 0
@@ -355,6 +401,21 @@ class LendingProtocol(gl.Contract):
         return self.pending_collateral_out
 
     @gl.public.view
+    def get_supply_queue_depth(self) -> u256:
+        """Registered-but-not-yet-settled supply tickets."""
+        return self.next_supply_ticket - self.next_supply_settle
+
+    @gl.public.view
+    def get_fund_queue_depth(self) -> u256:
+        """Registered-but-not-yet-settled fund tickets."""
+        return self.next_fund_ticket - self.next_fund_settle
+
+    @gl.public.view
+    def get_repay_queue_depth(self) -> u256:
+        """Registered-but-not-yet-settled repay tickets."""
+        return self.next_repay_ticket - self.next_repay_settle
+
+    @gl.public.view
     def get_liq_pending(self) -> bool:
         return self.liq_pending
 
@@ -452,27 +513,114 @@ class LendingProtocol(gl.Contract):
         """Collateral-side counterpart to reconcile_liquidity()."""
         return self._reconcile_collateral()
 
+    # ---------------- credit tickets: bind supply/fund/repay to their sender --
+    # Registering (calling supply()/fund()/repay()) queues a ticket. Settling
+    # (the same call, immediately after registering, or a later permissionless
+    # settle_*() call) drains the queue in registration order: a ticket is
+    # only paid once every ticket queued ahead of it is either paid or still
+    # unfillable, and it is always credited to the address that registered
+    # it - never to whoever happens to trigger the drain.
+    #
+    # This binds credit to REGISTRATION ORDER, which closes the exploit the
+    # steward flagged (an idle caller sweeping someone else's already-arrived,
+    # not-yet-claimed transfer with zero setup of their own). It is not a
+    # cryptographic proof of "who sent this specific transfer" - that would
+    # need an allowance/transferFrom the deployed tGEN/tUSDC tokens do not
+    # implement (this protocol has none, by design). A ticket queued AFTER
+    # excess already exists competes for that same anonymous excess exactly
+    # like any shared pool does; the guarantee is that nothing queued later
+    # can cut in front of a ticket already waiting. Registering before
+    # transferring is the safe pattern; transferring before registering
+    # leaves the excess first-come-first-served among tickets that exist
+    # once it lands.
+    def _drain_supply(self) -> None:
+        excess = self._reconcile_collateral()
+        i = self.next_supply_settle
+        stop = i + self.MAX_DRAIN
+        while i < self.next_supply_ticket and i < stop:
+            amt = self.supply_ticket_amount[i]
+            if amt > excess:
+                break
+            user = self.supply_ticket_user[i]
+            self.collateral_of[user] = self.collateral_of.get(user, u256(0)) + amt
+            self.tracked_collateral = self.tracked_collateral + amt
+            excess = excess - amt
+            i = i + u256(1)
+        self.next_supply_settle = i
+
+    def _drain_fund(self) -> None:
+        excess = self._reconcile_liquidity()
+        i = self.next_fund_settle
+        stop = i + self.MAX_DRAIN
+        while i < self.next_fund_ticket and i < stop:
+            amt = self.fund_ticket_amount[i]
+            if amt > excess:
+                break
+            self.tracked_liquidity = self.tracked_liquidity + amt
+            excess = excess - amt
+            i = i + u256(1)
+        self.next_fund_settle = i
+
+    def _drain_repay(self) -> None:
+        excess = self._reconcile_liquidity()
+        i = self.next_repay_settle
+        stop = i + self.MAX_DRAIN
+        while i < self.next_repay_ticket and i < stop:
+            amt = self.repay_ticket_amount[i]
+            if amt > excess:
+                break
+            user = self.repay_ticket_user[i]
+            debt = self.debt_of.get(user, u256(0))
+            # The registrant's debt may have shrunk (or been cleared by a
+            # liquidation) between registering and settling. Apply at most
+            # what they still owe rather than leaving the ticket stuck.
+            applied = amt if amt <= debt else debt
+            self.debt_of[user] = debt - applied
+            self.tracked_liquidity = self.tracked_liquidity + amt
+            excess = excess - amt
+            i = i + u256(1)
+        self.next_repay_settle = i
+
     # ---------------- liquidity provisioning (push) ----------------
     @gl.public.write
     def fund(self, amount: u256) -> u256:
+        assert amount > u256(0), "amount must be positive"
         assert not (self.liq_pending and self.liq_stage == u256(2)), (
             "liquidation settlement pending: call advance_liquidation() first"
         )
-        received = self._reconcile_liquidity()
-        assert received >= amount, "tUSDC not received: transfer amount to this contract first"
-        self.tracked_liquidity = self.tracked_liquidity + amount
+        ticket_id = self.next_fund_ticket
+        self.next_fund_ticket = ticket_id + u256(1)
+        self.fund_ticket_user[ticket_id] = gl.message.sender_address
+        self.fund_ticket_amount[ticket_id] = amount
+        self._drain_fund()
         return self.tracked_liquidity
+
+    @gl.public.write
+    def settle_fund(self) -> u256:
+        """Permissionless: drain queued fund tickets against currently
+        available liquidity, up to MAX_DRAIN per call."""
+        self._drain_fund()
+        return self.next_fund_settle
 
     # ---------------- supply collateral (push) ----------------
     @gl.public.write
     def supply(self, amount: u256) -> u256:
         assert amount > u256(0), "amount must be positive"
-        received = self._reconcile_collateral()
-        assert received >= amount, "tGEN not received: transfer amount to this contract first"
         user = gl.message.sender_address
-        self.collateral_of[user] = self.collateral_of.get(user, u256(0)) + amount
-        self.tracked_collateral = self.tracked_collateral + amount
-        return self.collateral_of[user]
+        ticket_id = self.next_supply_ticket
+        self.next_supply_ticket = ticket_id + u256(1)
+        self.supply_ticket_user[ticket_id] = user
+        self.supply_ticket_amount[ticket_id] = amount
+        self._drain_supply()
+        return self.collateral_of.get(user, u256(0))
+
+    @gl.public.write
+    def settle_supply(self) -> u256:
+        """Permissionless: drain queued supply tickets against currently
+        available collateral, up to MAX_DRAIN per call. Each ticket is
+        credited to whoever registered it, never to the caller here."""
+        self._drain_supply()
+        return self.next_supply_settle
 
     # ---------------- borrow (async payout, risk-gated) ----------------
     @gl.public.write
@@ -504,11 +652,20 @@ class LendingProtocol(gl.Contract):
         debt = self.debt_of.get(user, u256(0))
         assert debt > u256(0), "no outstanding debt"
         assert amount <= debt, "amount exceeds outstanding debt"
-        received = self._reconcile_liquidity()
-        assert received >= amount, "tUSDC not received: transfer amount to this contract first"
-        self.debt_of[user] = debt - amount
-        self.tracked_liquidity = self.tracked_liquidity + amount
-        return self.debt_of[user]
+        ticket_id = self.next_repay_ticket
+        self.next_repay_ticket = ticket_id + u256(1)
+        self.repay_ticket_user[ticket_id] = user
+        self.repay_ticket_amount[ticket_id] = amount
+        self._drain_repay()
+        return self.debt_of.get(user, u256(0))
+
+    @gl.public.write
+    def settle_repay(self) -> u256:
+        """Permissionless: drain queued repay tickets against currently
+        available liquidity, up to MAX_DRAIN per call. Each ticket is
+        credited to whoever registered it, never to the caller here."""
+        self._drain_repay()
+        return self.next_repay_settle
 
     # ---------------- withdraw collateral (async payout, risk-gated) --------
     @gl.public.write
@@ -596,22 +753,41 @@ class LendingProtocol(gl.Contract):
         if self.liq_stage == u256(1):
             unbooked = self._pool_unbooked_collateral()
             assert unbooked >= collat, "collateral has not reached the pool yet"
+            # Snapshot the pool's OWN debt-asset reserve right before the
+            # swap, so the swap's exact output can be measured at the
+            # source - see stage 2 below.
+            self.liq_reserve_b_before[liq_id] = Pool(self.trusted_pool).view().get_reserve_b()
             self._emit_swap(collat)
             self.liq_stage = u256(2)
             return u256(0)
 
         # ---- stage 2: wait for proceeds; retry the swap if it did not take ----
-        # Isolated from any concurrently in-flight borrow() payout via the same
-        # reconciliation used by supply()/fund()/repay(), so a pending payout
-        # can never be double-booked as swap proceeds.
-        proceeds = self._reconcile_liquidity()
-        if proceeds == u256(0):
+        # Isolate the EXACT pool return: the pool's own debt-asset reserve
+        # draining by X is exactly what it paid us for this swap, regardless
+        # of anything unrelated moving OUR balance in the same window (a
+        # stray transfer, a queued fund()/repay() ticket landing, dust, an
+        # in-flight borrow() payout). Reading our own balance instead - as
+        # the previous version did - cannot tell "the swap's proceeds" apart
+        # from "someone else's tokens that happened to arrive at the same
+        # time," which let unrelated funds get counted as liquidation
+        # proceeds and extinguish more of the borrower's debt than the sale
+        # actually raised.
+        reserve_b_before = self.liq_reserve_b_before.get(liq_id, u256(0))
+        reserve_b_now = Pool(self.trusted_pool).view().get_reserve_b()
+        pool_paid_out = reserve_b_before - reserve_b_now if reserve_b_now < reserve_b_before else u256(0)
+        if pool_paid_out == u256(0):
             # No proceeds. If the collateral is still sitting unbooked at the
             # pool, the swap did not take effect - emit it again.
             unbooked = self._pool_unbooked_collateral()
             assert unbooked >= collat, "swap has not settled yet - try again shortly"
             self._emit_swap(collat)
             return u256(0)
+
+        # Defense in depth: never book more than we can actually account for
+        # in our own balance, even though pool_paid_out is already the
+        # precise, isolated signal for what the swap itself returned.
+        available = self._reconcile_liquidity()
+        proceeds = pool_paid_out if pool_paid_out <= available else available
 
         user = self.liq_user.get(liq_id, Address(b"\x00" * 20))
         debt = self.debt_of.get(user, u256(0))

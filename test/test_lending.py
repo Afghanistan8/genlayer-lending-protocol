@@ -286,6 +286,10 @@ def _lending_env(vm, ltv_bps=7500, liquidation_bps=8000, rate=2, reserve_a=100_0
 
     ledger = _Ledger()
     verdict = {"text": "CALM - stable price, deep liquidity, neutral sentiment"}
+    # Mutable so tests can simulate the pool's OWN reserve draining when a
+    # swap actually executes (the signal _advance() now reads for isolating
+    # liquidation proceeds), independent of our contract's own balance.
+    pool_state = {"reserve_b": reserve_b}
 
     def hook(vm_ctx, request):
         from genlayer.py import calldata
@@ -309,7 +313,7 @@ def _lending_env(vm, ltv_bps=7500, liquidation_bps=8000, rate=2, reserve_a=100_0
                 if method == "get_reserve_a":
                     return bytes([0]) + calldata.encode(u256(reserve_a))
                 if method == "get_reserve_b":
-                    return bytes([0]) + calldata.encode(u256(reserve_b))
+                    return bytes([0]) + calldata.encode(u256(pool_state["reserve_b"]))
             return None
 
         if "PostMessage" in request:
@@ -320,9 +324,11 @@ def _lending_env(vm, ltv_bps=7500, liquidation_bps=8000, rate=2, reserve_a=100_0
 
             if method == "transfer":
                 ledger.queue_transfer(target, vm_ctx._contract_address, args[0], args[1])
-            # swap_a_for_b: intentionally a no-op here. Tests that reach the
-            # liquidation swap stage inject proceeds directly into the ledger
-            # to control the exact race window under test.
+            # swap_a_for_b: intentionally a no-op here (it doesn't move the
+            # ledger by itself). Tests drive a swap "executing" explicitly via
+            # execute_swap() below, which is the only thing that both drains
+            # the pool's reserve_b AND pays out tusdc - keeping the two
+            # observably in lockstep, the way a real AMM swap would.
             return {"ok": None}
 
         return None
@@ -341,6 +347,15 @@ def _lending_env(vm, ltv_bps=7500, liquidation_bps=8000, rate=2, reserve_a=100_0
         )
         return contract.assess_risk()
 
+    def execute_swap(output_amount):
+        """Simulate a liquidation's swap_a_for_b actually executing: the
+        pool's own reserve_b drains by output_amount, and that same amount is
+        credited to the contract's tusdc balance - exactly what a real AMM
+        swap does, and what _advance() stage 2 measures via the reserve_b
+        delta."""
+        pool_state["reserve_b"] = pool_state["reserve_b"] - int(output_amount)
+        ledger.credit(tusdc, vm._contract_address, output_amount)
+
     return {
         "vm": vm,
         "contract": contract,
@@ -350,12 +365,17 @@ def _lending_env(vm, ltv_bps=7500, liquidation_bps=8000, rate=2, reserve_a=100_0
         "pool": pool,
         "assess": assess,
         "owner": owner,
+        "execute_swap": execute_swap,
+        "pool_state": pool_state,
     }
 
 
 def test_borrow_before_repay_race():
     """A borrow() payout still sitting in the contract must not be claimable
-    by a zero-transfer repay() before the payout actually lands."""
+    by a zero-transfer repay() before the payout actually lands. supply()/
+    repay()/fund() no longer revert on insufficient funds - they queue a
+    ticket that simply stays unsettled - so the assertion here is "no credit
+    happened yet", not an exception."""
     vm = VMContext()
     env = _lending_env(vm)
     contract, ledger, tusdc, tgen = env["contract"], env["ledger"], env["tusdc"], env["tgen"]
@@ -377,19 +397,22 @@ def test_borrow_before_repay_race():
         assert int(contract.get_pending_liquidity_out()) == 500
 
         # ATTACK: claim the still-resident payout as a repayment, no transfer.
-        with pytest.raises(AssertionError, match="tUSDC not received"):
-            contract.repay(500)
+        # This queues a ticket, but there's no genuine excess to fund it.
+        debt_before = int(contract.get_debt(alice))
+        contract.repay(500)
+        assert int(contract.get_debt(alice)) == debt_before, "must NOT be credited"
+        assert int(contract.get_repay_queue_depth()) == 1, "ticket queued, unsettled"
 
-        # Once the payout genuinely lands, reconcile_liquidity() (permissionless,
-        # always succeeds) trues the earmark down to zero - it never stays
-        # forever claimable - and a real repay then works normally.
+        # Once the payout genuinely lands and a real transfer arrives, the
+        # SAME stuck ticket settles correctly - the earlier "attack" attempt
+        # wasn't wasted, it was just honestly unfunded until now.
         ledger.settle()
         contract.reconcile_liquidity()
         assert int(contract.get_pending_liquidity_out()) == 0
         ledger.credit(tusdc, vm._contract_address, 500)
-        contract.repay(500)
+        contract.settle_repay()
         assert int(contract.get_debt(alice)) == 0
-        assert int(contract.get_pending_liquidity_out()) == 0
+        assert int(contract.get_repay_queue_depth()) == 0
 
 
 def test_withdraw_before_supply_race():
@@ -408,19 +431,25 @@ def test_withdraw_before_supply_race():
         contract.withdraw(400)  # no debt, so no risk assessment needed
         assert int(contract.get_pending_collateral_out()) == 400
 
-        # ATTACK: claim the still-resident payout as new collateral.
-        with pytest.raises(AssertionError, match="tGEN not received"):
-            contract.supply(400)
+        # ATTACK: claim the still-resident payout as new collateral. Queues a
+        # ticket, but there's no genuine excess to fund it yet. withdraw()
+        # already dropped alice's OWN collateral_of to 600 (1000-400); the
+        # assertion is that this supply() attempt adds nothing on top.
+        contract.supply(400)
+        assert int(contract.get_collateral(alice)) == 600, "must NOT be credited"
+        assert int(contract.get_supply_queue_depth()) == 1
 
         # Once the payout genuinely lands, reconcile_collateral() trues the
-        # earmark down to zero, and a real supply then works normally.
+        # earmark down to zero, and the stuck ticket settles for real once
+        # real tokens arrive.
         ledger.settle()
         contract.reconcile_collateral()
         assert int(contract.get_pending_collateral_out()) == 0
         ledger.credit(tgen, vm._contract_address, 400)
-        contract.supply(400)
-        assert int(contract.get_collateral(alice)) == 1000
+        contract.settle_supply()
+        assert int(contract.get_collateral(alice)) == 1000  # 600 + the 400 ticket
         assert int(contract.get_pending_collateral_out()) == 0
+        assert int(contract.get_supply_queue_depth()) == 0
 
 
 def test_third_party_cannot_claim_pending_payout():
@@ -441,8 +470,7 @@ def test_third_party_cannot_claim_pending_payout():
 
         # Mallory has supplied nothing and transferred nothing.
         vm.sender = mallory
-        with pytest.raises(AssertionError, match="tGEN not received"):
-            contract.supply(1)
+        contract.supply(1)
 
         assert int(contract.get_collateral(mallory)) == 0
 
@@ -488,8 +516,10 @@ def test_repay_during_liquidation_is_blocked():
 
         # Simulate the swap's proceeds landing at the contract BEFORE
         # advance_liquidation() has run again to book them - the exact race
-        # window the steward flagged.
-        ledger.credit(tusdc, vm._contract_address, 900)
+        # window the steward flagged. execute_swap() drains the pool's own
+        # reserve_b in lockstep with crediting our tusdc balance, matching
+        # what a real AMM swap does (and what _advance() now measures).
+        env["execute_swap"](900)
 
         # ATTACK: alice tries to claim the unbooked liquidation proceeds as
         # her own repayment, with no transfer of her own, to shrink the debt
@@ -510,3 +540,171 @@ def test_repay_during_liquidation_is_blocked():
         ledger.credit(tusdc, vm._contract_address, 1)
         contract.repay(1)
         assert int(contract.get_debt(alice)) == 1500 - 900 - 1
+
+
+# ======================================================================
+# CREDIT-BINDING - registration-order tickets & isolated pool return
+# ======================================================================
+#
+# A raw balance-delta check cannot tell WHOSE transfer produced an increase,
+# only that one happened, so ANY caller could sweep an already-arrived,
+# not-yet-claimed transfer by calling supply()/fund()/repay() first - with
+# zero setup of their own. supply()/fund()/repay() now queue a numbered
+# ticket per call and settle it in registration order, always crediting the
+# address that registered the ticket. Liquidation proceeds are measured at
+# the pool's OWN reserve_b draining (via execute_swap() in the test double
+# below), not at our own contaminated balance, so an unrelated transfer
+# landing during the swap window can never inflate what gets booked.
+
+
+def test_actual_third_party_transfer_credits_the_registrant():
+    """Binding credit to sender: Alice registers her supply ticket BEFORE any
+    tokens arrive. The tokens that eventually fund it come from bob (an
+    actual third party - could be paying on Alice's behalf, could be
+    unrelated). Mallory notices the floating balance and tries to grab it by
+    registering AFTER it already exists. Settlement credits ALICE - the
+    registrant - never bob (who never registered) or Mallory (who registered
+    too late to cut the line)."""
+    vm = VMContext()
+    env = _lending_env(vm)
+    contract, ledger, tgen = env["contract"], env["ledger"], env["tgen"]
+
+    with vm.activate():
+        alice = create_address("alice")
+        bob = create_address("bob")
+        mallory = create_address("mallory")
+
+        # Alice registers intent to supply 100 BEFORE anything has arrived.
+        vm.sender = alice
+        contract.supply(100)
+        assert int(contract.get_supply_queue_depth()) == 1
+        assert int(contract.get_collateral(alice)) == 0
+
+        # An ACTUAL third party sends 100 tGEN to the contract. The contract
+        # has no way to learn from the balance alone that it "belongs" to
+        # alice - only registration order tells it who to credit.
+        ledger.credit(tgen, vm._contract_address, 100)
+
+        # Mallory notices the floating balance and tries to claim it by
+        # registering a ticket now, AFTER the excess already exists. Her own
+        # call drains the queue too: alice's earlier ticket is served first
+        # (in full, from the shared excess), leaving nothing for mallory's
+        # ticket in the SAME call that registered it.
+        vm.sender = mallory
+        contract.supply(100)
+
+        assert int(contract.get_collateral(alice)) == 100, "the registrant is credited"
+        assert int(contract.get_collateral(bob)) == 0, "bob never registered a ticket"
+        assert int(contract.get_collateral(mallory)) == 0, "mallory registered too late"
+        assert int(contract.get_supply_queue_depth()) == 1, "mallory's ticket is still stuck, unfunded"
+
+
+def test_unrelated_liquidation_transfer_is_not_counted_as_proceeds():
+    """A tusdc transfer that lands in the contract during a liquidation's
+    stage 2 - but is NOT the pool's actual swap output - must not be booked
+    as liquidation proceeds. Proceeds are isolated at the pool's own
+    reserve_b draining, not read off our own (contaminated) balance."""
+    vm = VMContext()
+    env = _lending_env(vm, rate=2, reserve_a=0)
+    contract, ledger, tgen, tusdc = env["contract"], env["ledger"], env["tgen"], env["tusdc"]
+
+    with vm.activate():
+        env["assess"]()
+
+        alice = create_address("alice")
+        vm.sender = alice
+        ledger.credit(tgen, vm._contract_address, 1000)
+        contract.supply(1000)
+
+        vm.sender = env["owner"]
+        ledger.credit(tusdc, vm._contract_address, 5000)
+        contract.fund(5000)
+
+        vm.sender = alice
+        contract.borrow(1500)
+        ledger.settle()
+        contract.reconcile_liquidity()
+
+        env["assess"]("CRISIS - extreme fear, collateral dwarfing pool depth")
+        liq_id = contract.liquidate(alice)
+        ledger.settle()
+        contract.advance_liquidation(liq_id)  # stage 1 -> 2, swap emitted
+        assert int(contract.get_liq_stage()) == 2
+
+        # An UNRELATED tusdc transfer lands during stage 2 - e.g. a mistaken
+        # transfer, or someone else's fund()/repay() ticket funding arriving
+        # in the same window. This is NOT the pool's swap output: the pool's
+        # own reserve_b has not moved.
+        vm.sender = create_address("random_sender")
+        ledger.credit(tusdc, vm._contract_address, 300)
+
+        # advance_liquidation() must not treat this as proceeds - the swap
+        # hasn't actually executed yet, so it just retries.
+        repaid = contract.advance_liquidation(liq_id)
+        assert int(repaid) == 0
+        assert int(contract.get_liq_stage()) == 2, "still awaiting the real swap"
+        assert int(contract.get_debt(alice)) == 1500, "unaffected by the unrelated transfer"
+
+        # The real swap now executes, draining the pool's reserve_b by
+        # exactly 900 and crediting our balance with the same 900.
+        env["execute_swap"](900)
+        repaid = contract.advance_liquidation(liq_id)
+        assert int(repaid) == 900, "booked amount is the swap's OWN output, not 900+300"
+        assert int(contract.get_debt(alice)) == 1500 - 900
+
+
+def test_repay_concurrent_with_settling_borrow_payout():
+    """A repay() ticket must be funded ONLY by the repayer's own genuine
+    transfer, never by a DIFFERENT, still-in-flight borrow() payout that
+    happens to be settling in the same window."""
+    vm = VMContext()
+    env = _lending_env(vm)
+    contract, ledger, tusdc, tgen = env["contract"], env["ledger"], env["tusdc"], env["tgen"]
+
+    with vm.activate():
+        env["assess"]()
+
+        alice = create_address("alice")
+        vm.sender = alice
+        ledger.credit(tgen, vm._contract_address, 1000)
+        contract.supply(1000)
+
+        vm.sender = env["owner"]
+        ledger.credit(tusdc, vm._contract_address, 5000)
+        contract.fund(5000)
+
+        # Alice's first borrow, fully landed and reconciled - a clean start.
+        vm.sender = alice
+        contract.borrow(200)
+        ledger.settle()
+        contract.reconcile_liquidity()
+        assert int(contract.get_debt(alice)) == 200
+
+        # A SECOND borrow's payout is still in flight (queued, not landed)
+        # while she tries to repay part of her debt.
+        contract.borrow(300)
+        assert int(contract.get_pending_liquidity_out()) == 300
+        assert int(contract.get_debt(alice)) == 500
+
+        # She sends a real, separate repayment of 50 and calls repay() WHILE
+        # the second borrow's 300 payout is still unsettled.
+        ledger.credit(tusdc, vm._contract_address, 50)
+        contract.repay(50)
+        assert int(contract.get_debt(alice)) == 500 - 50, "credited from her own 50"
+        assert int(contract.get_pending_liquidity_out()) == 300, "the payout is untouched"
+
+        # ATTACK-shaped case: she asks to repay 100 more, hoping to piggyback
+        # on the still-in-flight 300 payout, with no further real transfer.
+        contract.repay(100)
+        assert int(contract.get_debt(alice)) == 450, "must NOT be credited from the payout"
+        assert int(contract.get_repay_queue_depth()) == 1
+
+        # Once the second payout genuinely lands AND a real 100 arrives, the
+        # same stuck ticket settles correctly.
+        ledger.settle()
+        contract.reconcile_liquidity()
+        assert int(contract.get_pending_liquidity_out()) == 0
+        ledger.credit(tusdc, vm._contract_address, 100)
+        contract.settle_repay()
+        assert int(contract.get_debt(alice)) == 350
+        assert int(contract.get_repay_queue_depth()) == 0
