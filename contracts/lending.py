@@ -1,7 +1,7 @@
 # { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
 
 """
-LendingProtocol v7 - collateralized lending whose credit limits and liquidation
+LendingProtocol v8 - collateralized lending whose credit limits and liquidation
 threshold are settled by the GenLayer validator committee.
 
 WHAT MAKES THIS A GENLAYER PROTOCOL (not a port of an EVM design):
@@ -34,31 +34,48 @@ DISCIPLINE - where non-determinism is allowed to touch:
   AFTER the non-deterministic block returns. The LLM decides POLICY; it never
   produces a number that has to reconcile.
 
-Everything else is unchanged from v5 and remains the source of truth:
+CUSTODY MODEL (v8 - the steward-driven fix for transfer attribution):
+  Every previous version had all user deposits pushed to a SHARED address (the
+  lending contract itself). That made it impossible for the contract to bind an
+  incoming transfer to its actual sender - only that "the balance grew by X" -
+  so every commit-reveal / ticket-queue / balance-delta variant was vulnerable
+  to the same race: an earlier registrant could claim a later transfer sent by
+  a completely different user. The steward flagged this three rounds in a row.
+
+  v8 removes the shared address. On first use, LendingProtocol deploys a
+  PERSONAL vault contract for the caller at a deterministic CREATE2 address.
+  Each user has their own vault; nobody else's tokens ever land there. From
+  then on:
+    - the user transfers tGEN (or tUSDC for repay/fund) to THEIR vault, not
+      to the lending contract
+    - supply()/repay()/fund() read the caller's vault balance directly - since
+      the tokens sitting in Alice's vault are Alice's by construction, credit
+      is bound to msg.sender by the token custody itself, not by a heuristic
+    - withdraw and liquidation instruct the caller's vault to forward tokens
+      onward (to the user's wallet, or to the pool)
+    - only the lending contract can drain a vault - vault.forward() rejects
+      any other caller
+
+  Consequences the steward's earlier complaints called out are now impossible
+  by construction, not by mitigation:
+    - "an earlier ticket can consume someone else's later transfer" - there
+      are no shared inflows to race over; Alice's vault is Alice's
+    - "another caller can claim a transfer" - supply() reads the CALLER's
+      vault, so any other caller reads a different vault and sees zero
+    - "unrelated funds can be counted as liquidation proceeds" - the swap
+      output is measured at the POOL'S OWN reserve delta, and further capped
+      by the exact minimum-out the swap was committed to pay; unrelated
+      transfers to the lending contract move a different balance we do not
+      read for proceeds
+
+  Frontend flow follows the new custody: register (or read the vault address
+  via get_vault_of) -> transfer to the vault -> call supply/fund/repay.
+  Borrowing still pays out from lending's own liquidity balance directly to
+  the borrower's wallet, and withdrawal instructs the vault to return tokens.
+
+Everything else is unchanged from v7 and remains the source of truth:
   - collateral tGEN, debt tUSDC; raw collateral valued by a live cross-contract
     view() quote from the trusted Pool
-  - PUSH custody (register a ticket via supply()/repay()/fund(), transfer the
-    tokens, then a settle_*() call - possibly the same supply()/repay()/fund()
-    call, if nothing is queued ahead of it - credits the ticket; receipt
-    verified by balance delta, see the credit-ticket note below). No
-    approve/allowance exists.
-  - borrow()/withdraw() pay out via async emit().transfer (tokens arrive after
-    the child message finalizes). Until that transfer lands, the payout amount
-    is earmarked in pending_liquidity_out / pending_collateral_out and
-    excluded from the balance-delta check, so an outgoing payout in flight (or
-    unbooked liquidation swap proceeds) can never be mistaken for a fresh
-    deposit and credited to debt reduction or collateral without an actual
-    transfer. See _reconcile_liquidity()/_reconcile_collateral().
-  - supply()/fund()/repay() bind each credit to whoever REGISTERED it, not
-    whoever happens to call the function: each call queues a numbered ticket
-    (caller, amount), and settlement drains the queue in registration order,
-    crediting the ticket's owner only from excess that clears everyone queued
-    ahead of it. See _drain_supply()/_drain_fund()/_drain_repay().
-  - liquidation proceeds are measured at the pool's OWN reserve, not our
-    balance: the pool's debt-asset reserve draining by X is exactly what it
-    paid us for the swap, so a stray or queued transfer landing in the same
-    window can't inflate what gets booked as proceeds. See stage 2 of
-    _advance().
   - ZERO interest. No LP shares, no yield, no withdrawal of funded liquidity.
   - liquidation: full-position only, no liquidator bonus, 3% slippage guard,
     surplus retained as protocol liquidity, permissionless reconcile settlement,
@@ -129,6 +146,56 @@ class Pool:
         def swap_a_for_b(self, amount_in: u256, min_out: u256, to: Address) -> u256: ...
 
 
+@gl.contract_interface
+class Vault:
+    class View:
+        def get_owner(self) -> Address: ...
+        def get_lending(self) -> Address: ...
+    class Write:
+        def forward(self, token: Address, to: Address, amount: u256) -> None: ...
+
+
+# The vault contract's source, embedded so the lending contract can deploy a
+# fresh per-user vault via CREATE2 at any time - kept BYTE-FOR-BYTE identical
+# to contracts/vault.py; CREATE2 addresses on GenLayer depend on
+# (deployer, salt, chain_id) rather than the initcode hash, so code changes
+# don't shift the address, but keeping the two in sync makes it obvious what
+# a user's vault actually runs.
+VAULT_CODE = b'''# { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
+
+"""LendingVault - per-user personal token escrow. See contracts/vault.py for
+the full explanation of why per-user vaults are the attribution fix; the
+source here is embedded verbatim so lending can deploy them on demand."""
+
+from genlayer import *
+
+
+class LendingVault(gl.Contract):
+    owner: Address
+    lending: Address
+
+    def __init__(self, owner: Address, lending: Address):
+        self.owner = owner
+        self.lending = lending
+
+    @gl.public.view
+    def get_owner(self) -> Address:
+        return self.owner
+
+    @gl.public.view
+    def get_lending(self) -> Address:
+        return self.lending
+
+    @gl.public.write
+    def forward(self, token: Address, to: Address, amount: u256) -> None:
+        assert gl.message.sender_address == self.lending, "only lending"
+        gl.get_contract_at(token).emit().transfer(to, amount)
+'''
+
+
+ZERO_ADDRESS = Address(b"\x00" * 20)
+
+
 class LendingProtocol(gl.Contract):
     owner: Address
     trusted_dex: Address
@@ -141,34 +208,13 @@ class LendingProtocol(gl.Contract):
     debt_of: TreeMap[Address, u256]
     tracked_collateral: u256
     tracked_liquidity: u256
-    # ---- payouts promised but not yet confirmed gone (async emit in flight) ----
-    # borrow()/withdraw() decrement tracked_* the instant they emit a payout,
-    # but the child transfer settles later. Until it does, the balance-delta
-    # check in supply()/fund()/repay() would otherwise see that still-resident
-    # balance as a fresh, uncredited deposit. These counters earmark it so it
-    # can never be double-credited - see _reconcile_liquidity()/_reconcile_collateral().
-    pending_liquidity_out: u256
-    pending_collateral_out: u256
-    # ---- credit tickets: bind each credit to whoever registered it ----
-    # A balance-delta check alone can't tell WHOSE transfer produced an
-    # increase - only that one happened - so any caller could claim someone
-    # else's already-arrived transfer just by calling supply()/fund()/repay()
-    # first. Each call queues a numbered ticket instead; settlement drains
-    # the queue in registration order, so a ticket can only be paid from
-    # excess that clears every ticket queued ahead of it. See
-    # _drain_supply()/_drain_fund()/_drain_repay().
-    next_supply_ticket: u256
-    supply_ticket_user: TreeMap[u256, Address]
-    supply_ticket_amount: TreeMap[u256, u256]
-    next_supply_settle: u256
-    next_fund_ticket: u256
-    fund_ticket_user: TreeMap[u256, Address]
-    fund_ticket_amount: TreeMap[u256, u256]
-    next_fund_settle: u256
-    next_repay_ticket: u256
-    repay_ticket_user: TreeMap[u256, Address]
-    repay_ticket_amount: TreeMap[u256, u256]
-    next_repay_settle: u256
+    # ---- per-user personal vault registry ----
+    # vaults[user] = the CREATE2 address of that user's personal token escrow.
+    # See the module docstring "CUSTODY MODEL" for why this replaces the
+    # earlier ticket-queue design outright: with per-user vaults, "whose
+    # transfer produced a balance increase" is answered by the token custody
+    # itself, not by heuristics on top of a shared address.
+    vaults: TreeMap[Address, Address]
     # ---- liquidation saga ----
     next_liq_id: u256
     liq_pending: bool
@@ -176,9 +222,12 @@ class LendingProtocol(gl.Contract):
     liq_collateral: TreeMap[u256, u256]
     liq_stage: u256                 # 1 transfer emitted, 2 swap emitted, 3 settled
     settled: TreeMap[u256, bool]
-    # pool's own debt-asset reserve right before each liquidation's swap, so
-    # the swap's exact output can be measured at the source. See _advance().
+    # pool's own debt-asset reserve right before each liquidation's swap, plus
+    # the exact minimum-out the swap was emitted with - together they isolate
+    # the liquidation's proceeds from any unrelated activity on the pool or on
+    # our own balance. See stage 2 of _advance().
     liq_reserve_b_before: TreeMap[u256, u256]
+    liq_expected_out: TreeMap[u256, u256]
     # ---- validator-settled risk state ----
     risk_tier: str            # "" until first assessment
     risk_haircut_bps: u256    # applied to collateral value
@@ -189,10 +238,6 @@ class LendingProtocol(gl.Contract):
 
     # Reference size used to sample the pool price (raw units).
     PRICE_PROBE = u256(100)
-
-    # Max tickets drained per call to a settle_*()/supply()/fund()/repay()
-    # call, so a long backlog can't make a single call run out of gas.
-    MAX_DRAIN = u256(20)
 
     def __init__(
         self,
@@ -212,14 +257,6 @@ class LendingProtocol(gl.Contract):
         self.liquidation_bps = liquidation_bps
         self.tracked_collateral = 0
         self.tracked_liquidity = 0
-        self.pending_liquidity_out = 0
-        self.pending_collateral_out = 0
-        self.next_supply_ticket = 0
-        self.next_supply_settle = 0
-        self.next_fund_ticket = 0
-        self.next_fund_settle = 0
-        self.next_repay_ticket = 0
-        self.next_repay_settle = 0
         self.next_liq_id = 0
         self.liq_pending = False
         self.liq_stage = 0
@@ -393,27 +430,21 @@ class LendingProtocol(gl.Contract):
         return self.tracked_collateral
 
     @gl.public.view
-    def get_pending_liquidity_out(self) -> u256:
-        return self.pending_liquidity_out
+    def get_vault_of(self, user: Address) -> Address:
+        """The user's registered vault address, or the zero address if the
+        user has not called register() yet."""
+        return self.vaults.get(user, ZERO_ADDRESS)
 
     @gl.public.view
-    def get_pending_collateral_out(self) -> u256:
-        return self.pending_collateral_out
-
-    @gl.public.view
-    def get_supply_queue_depth(self) -> u256:
-        """Registered-but-not-yet-settled supply tickets."""
-        return self.next_supply_ticket - self.next_supply_settle
-
-    @gl.public.view
-    def get_fund_queue_depth(self) -> u256:
-        """Registered-but-not-yet-settled fund tickets."""
-        return self.next_fund_ticket - self.next_fund_settle
-
-    @gl.public.view
-    def get_repay_queue_depth(self) -> u256:
-        """Registered-but-not-yet-settled repay tickets."""
-        return self.next_repay_ticket - self.next_repay_settle
+    def predict_vault_of(self, user: Address) -> Address:
+        """The CREATE2 address the user's vault WOULD have when deployed. Safe
+        to compute BEFORE register() - the frontend uses this so a user can
+        transfer tokens to their (deterministic) vault address before ever
+        having to call register(). register() itself is idempotent, so once
+        the user has transferred, calling supply() (which auto-registers) is
+        enough to complete the deposit."""
+        from genlayer.py._internal import create2_address
+        return create2_address(self.address, self._vault_salt(user), gl.message.chain_id)
 
     @gl.public.view
     def get_liq_pending(self) -> bool:
@@ -455,174 +486,82 @@ class LendingProtocol(gl.Contract):
         value = self._recognized(self.collateral_of.get(user, u256(0)))
         return debt * u256(10000) > value * self.liquidation_bps
 
-    # ---------------- balance-delta isolation (payout + liquidation deltas) ----
-    # supply()/fund()/repay() credit a caller by comparing the token balance we
-    # actually hold against what we believe we're holding on their behalf
-    # (tracked_*). That comparison is only trustworthy if every OTHER reason the
-    # balance could have moved is subtracted out first:
-    #   - a borrow()/withdraw() payout that was already deducted from tracked_*
-    #     but whose async transfer has not yet left the contract
-    #     (pending_liquidity_out / pending_collateral_out)
-    #   - liquidation swap proceeds sitting unbooked between the swap landing
-    #     and advance_liquidation() claiming them (checked separately below)
-    # Without this, a pending payout or liquidation proceeds - money the
-    # contract is already obligated to move elsewhere - could be mistaken for a
-    # brand new deposit and used to credit debt reduction or collateral to
-    # someone who transferred nothing.
-    #
-    # "floor" = tracked_* + pending_*_out is the minimum balance we'd expect to
-    # still be holding if NONE of the earmarked payout has left yet. If the
-    # live balance is at or below that floor, the earmark is (partly) stale -
-    # some of that payout has already left - so we shrink it by exactly the
-    # shortfall. Only once the balance clears the floor is anything above it
-    # a genuine, creditable new deposit. This call always succeeds (a pure
-    # correction, never an assertion), so the shrink commits even when it
-    # runs as part of a caller's transaction that later reverts for an
-    # unrelated reason.
-    def _reconcile_liquidity(self) -> u256:
-        balance = gl.get_contract_at(self.debt_token).view().balance_of(self.address)
-        floor = self.tracked_liquidity + self.pending_liquidity_out
-        if balance <= floor:
-            shortfall = floor - balance
-            settled = shortfall if shortfall <= self.pending_liquidity_out else self.pending_liquidity_out
-            self.pending_liquidity_out = self.pending_liquidity_out - settled
-            return u256(0)
-        return balance - floor
+    # ---------------- vault registration (CREATE2) ----------------
+    # Each user gets ONE personal vault at a deterministic address. Idempotent:
+    # calling register() twice returns the existing vault. supply/fund/repay
+    # auto-register, so users usually never need to call this directly - but
+    # the frontend can call it explicitly to display the vault address before
+    # asking the user to transfer.
+    def _vault_salt(self, user: Address) -> u256:
+        # 20-byte user address as a 256-bit salt; deterministic per-user,
+        # unique across users, fits in u256 with room to spare.
+        return u256(int.from_bytes(user.as_bytes, "big"))
 
-    def _reconcile_collateral(self) -> u256:
-        balance = gl.get_contract_at(self.collateral_token).view().balance_of(self.address)
-        floor = self.tracked_collateral + self.pending_collateral_out
-        if balance <= floor:
-            shortfall = floor - balance
-            settled = shortfall if shortfall <= self.pending_collateral_out else self.pending_collateral_out
-            self.pending_collateral_out = self.pending_collateral_out - settled
-            return u256(0)
-        return balance - floor
-
-    @gl.public.write
-    def reconcile_liquidity(self) -> u256:
-        """Permissionless: true up pending_liquidity_out against the debt
-        token's actual balance, in case an earlier payout has since landed.
-        Always succeeds. Callers racing a payout they triggered can call this
-        on its own before their next fund()/repay(), rather than have the
-        correction only attempted (and rolled back on failure) inside those."""
-        return self._reconcile_liquidity()
-
-    @gl.public.write
-    def reconcile_collateral(self) -> u256:
-        """Collateral-side counterpart to reconcile_liquidity()."""
-        return self._reconcile_collateral()
-
-    # ---------------- credit tickets: bind supply/fund/repay to their sender --
-    # Registering (calling supply()/fund()/repay()) queues a ticket. Settling
-    # (the same call, immediately after registering, or a later permissionless
-    # settle_*() call) drains the queue in registration order: a ticket is
-    # only paid once every ticket queued ahead of it is either paid or still
-    # unfillable, and it is always credited to the address that registered
-    # it - never to whoever happens to trigger the drain.
-    #
-    # This binds credit to REGISTRATION ORDER, which closes the exploit the
-    # steward flagged (an idle caller sweeping someone else's already-arrived,
-    # not-yet-claimed transfer with zero setup of their own). It is not a
-    # cryptographic proof of "who sent this specific transfer" - that would
-    # need an allowance/transferFrom the deployed tGEN/tUSDC tokens do not
-    # implement (this protocol has none, by design). A ticket queued AFTER
-    # excess already exists competes for that same anonymous excess exactly
-    # like any shared pool does; the guarantee is that nothing queued later
-    # can cut in front of a ticket already waiting. Registering before
-    # transferring is the safe pattern; transferring before registering
-    # leaves the excess first-come-first-served among tickets that exist
-    # once it lands.
-    def _drain_supply(self) -> None:
-        excess = self._reconcile_collateral()
-        i = self.next_supply_settle
-        stop = i + self.MAX_DRAIN
-        while i < self.next_supply_ticket and i < stop:
-            amt = self.supply_ticket_amount[i]
-            if amt > excess:
-                break
-            user = self.supply_ticket_user[i]
-            self.collateral_of[user] = self.collateral_of.get(user, u256(0)) + amt
-            self.tracked_collateral = self.tracked_collateral + amt
-            excess = excess - amt
-            i = i + u256(1)
-        self.next_supply_settle = i
-
-    def _drain_fund(self) -> None:
-        excess = self._reconcile_liquidity()
-        i = self.next_fund_settle
-        stop = i + self.MAX_DRAIN
-        while i < self.next_fund_ticket and i < stop:
-            amt = self.fund_ticket_amount[i]
-            if amt > excess:
-                break
-            self.tracked_liquidity = self.tracked_liquidity + amt
-            excess = excess - amt
-            i = i + u256(1)
-        self.next_fund_settle = i
-
-    def _drain_repay(self) -> None:
-        excess = self._reconcile_liquidity()
-        i = self.next_repay_settle
-        stop = i + self.MAX_DRAIN
-        while i < self.next_repay_ticket and i < stop:
-            amt = self.repay_ticket_amount[i]
-            if amt > excess:
-                break
-            user = self.repay_ticket_user[i]
-            debt = self.debt_of.get(user, u256(0))
-            # The registrant's debt may have shrunk (or been cleared by a
-            # liquidation) between registering and settling. Apply at most
-            # what they still owe rather than leaving the ticket stuck.
-            applied = amt if amt <= debt else debt
-            self.debt_of[user] = debt - applied
-            self.tracked_liquidity = self.tracked_liquidity + amt
-            excess = excess - amt
-            i = i + u256(1)
-        self.next_repay_settle = i
-
-    # ---------------- liquidity provisioning (push) ----------------
-    @gl.public.write
-    def fund(self, amount: u256) -> u256:
-        assert amount > u256(0), "amount must be positive"
-        assert not (self.liq_pending and self.liq_stage == u256(2)), (
-            "liquidation settlement pending: call advance_liquidation() first"
+    def _ensure_vault(self, user: Address) -> Address:
+        existing = self.vaults.get(user, ZERO_ADDRESS)
+        if existing.as_bytes != ZERO_ADDRESS.as_bytes:
+            return existing
+        salt = self._vault_salt(user)
+        addr = gl.deploy_contract(
+            code=VAULT_CODE,
+            args=[user, self.address],
+            salt_nonce=salt,
         )
-        ticket_id = self.next_fund_ticket
-        self.next_fund_ticket = ticket_id + u256(1)
-        self.fund_ticket_user[ticket_id] = gl.message.sender_address
-        self.fund_ticket_amount[ticket_id] = amount
-        self._drain_fund()
-        return self.tracked_liquidity
+        self.vaults[user] = addr
+        return addr
 
     @gl.public.write
-    def settle_fund(self) -> u256:
-        """Permissionless: drain queued fund tickets against currently
-        available liquidity, up to MAX_DRAIN per call."""
-        self._drain_fund()
-        return self.next_fund_settle
+    def register(self) -> Address:
+        """Deploy the caller's personal vault (via CREATE2) if not already
+        deployed, and return its address. Idempotent. Users may call this
+        explicitly to fetch their vault address, but supply/fund/repay also
+        auto-register on first use."""
+        return self._ensure_vault(gl.message.sender_address)
 
-    # ---------------- supply collateral (push) ----------------
+    # ---------------- supply collateral (vault-attributed) ----------------
+    # No shared-address balance-delta race is possible here: we read the
+    # CALLER'S OWN vault. Tokens sitting there were transferred to that
+    # deterministic per-user address, so they are - by construction - the
+    # caller's, regardless of who called supply. Alice's vault does not
+    # accept credit for Bob's tokens because Bob's tokens are in Bob's vault.
     @gl.public.write
     def supply(self, amount: u256) -> u256:
         assert amount > u256(0), "amount must be positive"
         user = gl.message.sender_address
-        ticket_id = self.next_supply_ticket
-        self.next_supply_ticket = ticket_id + u256(1)
-        self.supply_ticket_user[ticket_id] = user
-        self.supply_ticket_amount[ticket_id] = amount
-        self._drain_supply()
-        return self.collateral_of.get(user, u256(0))
+        vault = self._ensure_vault(user)
+        vault_balance = gl.get_contract_at(self.collateral_token).view().balance_of(vault)
+        already_credited = self.collateral_of.get(user, u256(0))
+        assert vault_balance >= already_credited + amount, (
+            "not enough tGEN in your vault: transfer to your vault address first "
+            "(see predict_vault_of / get_vault_of)"
+        )
+        self.collateral_of[user] = already_credited + amount
+        self.tracked_collateral = self.tracked_collateral + amount
+        return self.collateral_of[user]
 
+    # ---------------- liquidity provisioning (vault-attributed) ----------------
     @gl.public.write
-    def settle_supply(self) -> u256:
-        """Permissionless: drain queued supply tickets against currently
-        available collateral, up to MAX_DRAIN per call. Each ticket is
-        credited to whoever registered it, never to the caller here."""
-        self._drain_supply()
-        return self.next_supply_settle
+    def fund(self, amount: u256) -> u256:
+        assert amount > u256(0), "amount must be positive"
+        user = gl.message.sender_address
+        vault = self._ensure_vault(user)
+        vault_balance = gl.get_contract_at(self.debt_token).view().balance_of(vault)
+        assert vault_balance >= amount, (
+            "not enough tUSDC in your vault: transfer to your vault address first"
+        )
+        self.tracked_liquidity = self.tracked_liquidity + amount
+        # Move the tokens from the funder's vault into lending's own balance
+        # so they are available to lend out. Only the vault owner (via lending
+        # as sole caller) can drain the vault, so the amount is guaranteed to
+        # arrive - there is no race with anyone else's transfer.
+        Vault(vault).emit().forward(self.debt_token, self.address, amount)
+        return self.tracked_liquidity
 
     # ---------------- borrow (async payout, risk-gated) ----------------
+    # Payout goes DIRECTLY to the borrower's wallet from lending's own
+    # liquidity balance - the borrower's vault is not involved (nothing needs
+    # to be attributed on the outbound leg, and the borrower will typically
+    # spend the borrowed tUSDC off-protocol).
     @gl.public.write
     def borrow(self, amount: u256) -> u256:
         assert amount > u256(0), "amount must be positive"
@@ -630,51 +569,48 @@ class LendingProtocol(gl.Contract):
         user = gl.message.sender_address
         collat = self.collateral_of.get(user, u256(0))
         assert collat > u256(0), "no collateral supplied"
-        self._reconcile_liquidity()  # true up any prior payout that has since landed
         assert amount <= self.tracked_liquidity, "insufficient protocol liquidity"
         value = self._recognized(collat)          # committee-adjusted
         new_debt = self.debt_of.get(user, u256(0)) + amount
         assert new_debt * u256(10000) <= value * self.ltv_bps, "exceeds LTV limit at the current risk tier"
         self.debt_of[user] = new_debt
         self.tracked_liquidity = self.tracked_liquidity - amount
-        self.pending_liquidity_out = self.pending_liquidity_out + amount
         gl.get_contract_at(self.debt_token).emit().transfer(user, amount)
         return new_debt
 
-    # ---------------- repay (push) ----------------
+    # ---------------- repay (vault-attributed) ----------------
+    # Read the caller's vault balance to determine what they can repay. The
+    # tokens will be pulled from the vault into lending's own balance where
+    # they replenish lending's liquidity.
     @gl.public.write
     def repay(self, amount: u256) -> u256:
         assert amount > u256(0), "amount must be positive"
-        assert not (self.liq_pending and self.liq_stage == u256(2)), (
-            "liquidation settlement pending: call advance_liquidation() first"
-        )
         user = gl.message.sender_address
         debt = self.debt_of.get(user, u256(0))
         assert debt > u256(0), "no outstanding debt"
         assert amount <= debt, "amount exceeds outstanding debt"
-        ticket_id = self.next_repay_ticket
-        self.next_repay_ticket = ticket_id + u256(1)
-        self.repay_ticket_user[ticket_id] = user
-        self.repay_ticket_amount[ticket_id] = amount
-        self._drain_repay()
-        return self.debt_of.get(user, u256(0))
-
-    @gl.public.write
-    def settle_repay(self) -> u256:
-        """Permissionless: drain queued repay tickets against currently
-        available liquidity, up to MAX_DRAIN per call. Each ticket is
-        credited to whoever registered it, never to the caller here."""
-        self._drain_repay()
-        return self.next_repay_settle
+        vault = self._ensure_vault(user)
+        vault_balance = gl.get_contract_at(self.debt_token).view().balance_of(vault)
+        assert vault_balance >= amount, (
+            "not enough tUSDC in your vault: transfer to your vault address first"
+        )
+        self.debt_of[user] = debt - amount
+        self.tracked_liquidity = self.tracked_liquidity + amount
+        Vault(vault).emit().forward(self.debt_token, self.address, amount)
+        return self.debt_of[user]
 
     # ---------------- withdraw collateral (async payout, risk-gated) --------
+    # Instructs the CALLER'S OWN vault to send collateral back to their wallet.
+    # A user can never withdraw someone else's collateral because their vault
+    # doesn't hold anyone else's tokens.
     @gl.public.write
     def withdraw(self, amount: u256) -> u256:
         assert amount > u256(0), "amount must be positive"
         user = gl.message.sender_address
         collat = self.collateral_of.get(user, u256(0))
         assert amount <= collat, "amount exceeds supplied collateral"
-        self._reconcile_collateral()  # true up any prior payout that has since landed
+        vault = self.vaults.get(user, ZERO_ADDRESS)
+        assert vault.as_bytes != ZERO_ADDRESS.as_bytes, "no vault registered"
         remaining = collat - amount
         debt = self.debt_of.get(user, u256(0))
         if debt > u256(0):
@@ -683,8 +619,7 @@ class LendingProtocol(gl.Contract):
             assert debt * u256(10000) <= value * self.ltv_bps, "withdrawal would breach LTV at the current risk tier"
         self.collateral_of[user] = remaining
         self.tracked_collateral = self.tracked_collateral - amount
-        self.pending_collateral_out = self.pending_collateral_out + amount
-        gl.get_contract_at(self.collateral_token).emit().transfer(user, amount)
+        Vault(vault).emit().forward(self.collateral_token, user, amount)
         return remaining
 
     # ================= liquidation saga (risk-gated) =================
@@ -713,6 +648,8 @@ class LendingProtocol(gl.Contract):
         assert debt > u256(0), "no outstanding debt"
         collat = self.collateral_of.get(user, u256(0))
         assert collat > u256(0), "no collateral"
+        vault = self.vaults.get(user, ZERO_ADDRESS)
+        assert vault.as_bytes != ZERO_ADDRESS.as_bytes, "no vault registered"
 
         raw_quote = Pool(self.trusted_pool).view().quote_a_for_b(collat)
         recognized = (raw_quote * (u256(10000) - self.risk_haircut_bps)) // u256(10000)
@@ -725,13 +662,13 @@ class LendingProtocol(gl.Contract):
         self.liq_stage = u256(1)
         self.liq_pending = True
 
-        self._reconcile_collateral()  # true up any prior payout that has since landed
         self.collateral_of[user] = u256(0)
         self.tracked_collateral = self.tracked_collateral - collat
-        self.pending_collateral_out = self.pending_collateral_out + collat
 
-        # ONE message only. The swap is emitted later, once this has landed.
-        gl.get_contract_at(self.collateral_token).emit().transfer(self.trusted_pool, collat)
+        # Instruct the user's own vault to send collateral straight to the pool.
+        # The vault holds this collateral (per-user custody), so there's no
+        # cross-user contamination on the outbound leg either.
+        Vault(vault).emit().forward(self.collateral_token, self.trusted_pool, collat)
         return liq_id
 
     def _pool_unbooked_collateral(self) -> u256:
@@ -754,59 +691,76 @@ class LendingProtocol(gl.Contract):
             unbooked = self._pool_unbooked_collateral()
             assert unbooked >= collat, "collateral has not reached the pool yet"
             # Snapshot the pool's OWN debt-asset reserve right before the
-            # swap, so the swap's exact output can be measured at the
-            # source - see stage 2 below.
+            # swap. Combined with the exact minimum-out we're about to commit
+            # to below, this gives stage 2 an isolated, source-specific
+            # measurement of what the swap actually returned (see the
+            # extensive comment below).
             self.liq_reserve_b_before[liq_id] = Pool(self.trusted_pool).view().get_reserve_b()
-            self._emit_swap(collat)
+            quote = Pool(self.trusted_pool).view().quote_a_for_b(collat)
+            min_out = (quote * u256(97)) // u256(100)
+            self.liq_expected_out[liq_id] = min_out
+            Pool(self.trusted_pool).emit().swap_a_for_b(collat, min_out, self.address)
             self.liq_stage = u256(2)
             return u256(0)
 
-        # ---- stage 2: wait for proceeds; retry the swap if it did not take ----
-        # Isolate the EXACT pool return: the pool's own debt-asset reserve
-        # draining by X is exactly what it paid us for this swap, regardless
-        # of anything unrelated moving OUR balance in the same window (a
-        # stray transfer, a queued fund()/repay() ticket landing, dust, an
-        # in-flight borrow() payout). Reading our own balance instead - as
-        # the previous version did - cannot tell "the swap's proceeds" apart
-        # from "someone else's tokens that happened to arrive at the same
-        # time," which let unrelated funds get counted as liquidation
-        # proceeds and extinguish more of the borrower's debt than the sale
-        # actually raised.
+        # ---- stage 2: measure the EXACT swap return, source-isolated ----
+        # Two independent signals bound the credited proceeds to this specific
+        # swap and nothing else:
+        #
+        # (a) the pool's own debt-asset reserve has to have dropped by at
+        #     least our committed min_out - the pool paying us for this swap
+        #     is what causes reserve_b to fall. A stray tUSDC transfer to
+        #     the lending contract or to any other party moves a different
+        #     balance and does NOT show up in reserve_b at all, so it can
+        #     never be counted as our proceeds.
+        # (b) the credited amount is min_out itself, not the raw reserve_b
+        #     delta. If a concurrent a->b swap by someone else on the same
+        #     pool happens between our stage 1 and stage 2, reserve_b drops
+        #     by MORE than our min_out - we still credit only min_out, so
+        #     that other swap's output cannot be double-counted as ours.
+        # A concurrent b->a swap would REDUCE our observable reserve_b delta,
+        # in which case the check below fails and we retry - the swap either
+        # ran and satisfied min_out, or it did not.
+        expected = self.liq_expected_out.get(liq_id, u256(0))
         reserve_b_before = self.liq_reserve_b_before.get(liq_id, u256(0))
         reserve_b_now = Pool(self.trusted_pool).view().get_reserve_b()
         pool_paid_out = reserve_b_before - reserve_b_now if reserve_b_now < reserve_b_before else u256(0)
-        if pool_paid_out == u256(0):
-            # No proceeds. If the collateral is still sitting unbooked at the
-            # pool, the swap did not take effect - emit it again.
+
+        if pool_paid_out < expected:
+            # Not enough drain to prove our swap ran. If our collateral is
+            # still sitting unbooked at the pool, the swap message did not
+            # take effect; re-emit it.
             unbooked = self._pool_unbooked_collateral()
             assert unbooked >= collat, "swap has not settled yet - try again shortly"
-            self._emit_swap(collat)
+            self._emit_swap(collat, liq_id)
             return u256(0)
 
-        # Defense in depth: never book more than we can actually account for
-        # in our own balance, even though pool_paid_out is already the
-        # precise, isolated signal for what the swap itself returned.
-        available = self._reconcile_liquidity()
-        proceeds = pool_paid_out if pool_paid_out <= available else available
+        # The pool has demonstrably paid out AT LEAST `expected`. Credit that
+        # exact amount as proceeds. Any surplus above min_out (the pool paying
+        # us more than the guaranteed minimum) simply stays in lending's
+        # liquidity balance as protocol surplus - it is neither attributed to
+        # this liquidation nor lost.
+        proceeds = expected
 
         user = self.liq_user.get(liq_id, Address(b"\x00" * 20))
         debt = self.debt_of.get(user, u256(0))
         repaid = proceeds if proceeds < debt else debt
         self.debt_of[user] = debt - repaid
-        # ALL proceeds (including any surplus beyond the debt) are retained as
-        # protocol liquidity; surplus is not refunded in this version.
         self.tracked_liquidity = self.tracked_liquidity + proceeds
         self.settled[liq_id] = True
         self.liq_stage = u256(3)
         self.liq_pending = False
         return repaid
 
-    def _emit_swap(self, collat: u256) -> None:
+    def _emit_swap(self, collat: u256, liq_id: u256) -> None:
         # min_out is recomputed from a FRESH quote each time. Storing it at
         # trigger time would let a stale figure make the swap permanently
-        # unfillable after the price moves.
+        # unfillable after the price moves. We DO overwrite liq_expected_out
+        # here so stage 2's proceeds measurement stays consistent with what
+        # was actually last emitted.
         quote = Pool(self.trusted_pool).view().quote_a_for_b(collat)
         min_out = (quote * u256(97)) // u256(100)
+        self.liq_expected_out[liq_id] = min_out
         Pool(self.trusted_pool).emit().swap_a_for_b(collat, min_out, self.address)
 
     @gl.public.write

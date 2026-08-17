@@ -63,6 +63,12 @@ type Acct = {
   recognizedValue: string;
   tgenBalance: string;
   tusdcBalance: string;
+  // v8 vault-based custody: deterministic CREATE2 address the user must
+  // transfer tokens to (before supply/fund/repay). Same address whether or
+  // not the vault is actually deployed yet — deployed lazily on first use.
+  vault: string;
+  vaultTgenBalance: string;
+  vaultTusdcBalance: string;
 };
 
 const ZERO_ACCT: Acct = {
@@ -74,6 +80,9 @@ const ZERO_ACCT: Acct = {
   recognizedValue: "0",
   tgenBalance: "0",
   tusdcBalance: "0",
+  vault: "",
+  vaultTgenBalance: "0",
+  vaultTusdcBalance: "0",
 };
 
 // Last KNOWN-GOOD snapshots (only ever written when a wave read cleanly). These
@@ -250,7 +259,7 @@ export async function GET(req: NextRequest) {
     } else {
       const before = errors.length;
       const a = addr(address);
-      const [collateral, debt, maxBorrow, liquidatableStr, tgenBalance, tusdcBalance] =
+      const [collateral, debt, maxBorrow, liquidatableStr, tgenBalance, tusdcBalance, vault] =
         await pooled(
           [
             () => num(LENDING, "get_collateral", [a]),
@@ -259,6 +268,7 @@ export async function GET(req: NextRequest) {
             () => boolStr(LENDING, "is_liquidatable", [a]),
             () => num(TGEN, "balance_of", [a]),
             () => num(TUSDC, "balance_of", [a]),
+            () => str(LENDING, "predict_vault_of", [a]),
           ],
           CONCURRENCY
         );
@@ -271,6 +281,22 @@ export async function GET(req: NextRequest) {
       }
       const recognizedValue = applyHaircut(collateralValue, proto.riskHaircutBps);
 
+      // Vault balances: what's sitting in the user's vault ready for
+      // supply/fund/repay to book. Zero when vault is empty or address is
+      // malformed. Reads are pooled with the account block above so this
+      // extra visibility does not add a burst against studionet's 30/min.
+      let vaultTgenBalance = "0";
+      let vaultTusdcBalance = "0";
+      if (vault && /^0x[0-9a-fA-F]{40}$/.test(vault)) {
+        [vaultTgenBalance, vaultTusdcBalance] = await pooled(
+          [
+            () => num(TGEN, "balance_of", [addr(vault)]),
+            () => num(TUSDC, "balance_of", [addr(vault)]),
+          ],
+          CONCURRENCY
+        );
+      }
+
       const fresh: Acct = {
         collateral,
         debt,
@@ -280,6 +306,9 @@ export async function GET(req: NextRequest) {
         recognizedValue,
         tgenBalance,
         tusdcBalance,
+        vault,
+        vaultTgenBalance,
+        vaultTusdcBalance,
       };
 
       if (errors.length === before) {

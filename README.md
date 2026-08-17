@@ -21,7 +21,7 @@ and ruled that conditions are stressed. That ruling isn't advisory — `borrow()
 and `liquidate()` refuse to execute until the committee has spoken.
 
 - **Live app:** https://genlayer-lending-protocol.vercel.app
-- **Contract:** `0xDEA63B16f2e76beB68294fb325902E29944dAf1D` (studionet, chain 61999)
+- **Contract:** `0xA4db027a94120727f908A40AEA1f285b026c0D12` (studionet, chain 61999)
 - **Stack:** Python Intelligent Contracts · Next.js + genlayer-js frontend
 
 ---
@@ -226,19 +226,17 @@ pool will actually pay. The haircut governs solvency policy, not execution price
 | `is_liquidatable(user)` | view | true when debt exceeds 80% of recognized value |
 | `get_collateral` / `get_debt` | view | per-user position |
 | `get_tracked_collateral` / `get_tracked_liquidity` | view | protocol-wide booked balances |
-| `get_pending_collateral_out` / `get_pending_liquidity_out` | view | payouts emitted but not yet confirmed gone; excluded from deposit crediting |
-| `get_supply_queue_depth` / `get_fund_queue_depth` / `get_repay_queue_depth` | view | registered-but-not-yet-settled credit tickets |
+| `get_vault_of(user)` | view | the user's registered CREATE2 vault address (zero if not yet registered) |
+| `predict_vault_of(user)` | view | the CREATE2 address the user's vault would take — safe to compute before `register()`, the frontend uses this to show the deposit address |
 | `get_liq_pending` | view | whether a liquidation awaits settlement |
 | `get_pending_liq_id` | view | the id of the pending liquidation (0 when none) — the frontend settles against this |
-| `fund(amount)` | write | queues a credit ticket for the transferred tUSDC and drains the queue (permissionless) |
-| `settle_fund()` | write | permissionless: drains queued fund tickets without registering a new one |
-| `supply(amount)` | write | queues a credit ticket for the transferred tGEN, crediting collateral as the queue drains |
-| `settle_supply()` | write | permissionless: drains queued supply tickets without registering a new one |
-| `borrow(amount)` | write | **requires a ruling**; records debt, emits payout, enforces LTV on recognized value |
-| `repay(amount)` | write | queues a credit ticket for the transferred tUSDC, reducing debt as the queue drains |
-| `settle_repay()` | write | permissionless: drains queued repay tickets without registering a new one |
-| `withdraw(amount)` | write | emits collateral back; re-checks LTV on recognized value |
-| `liquidate(user)` | write | **requires a ruling**; permissionless; seizes collateral, emits the transfer (the swap follows in `advance_liquidation`) |
+| `register()` | write | deploys the caller's personal vault at its deterministic CREATE2 address; idempotent (returns existing on second call); `supply`/`fund`/`repay` auto-register on first use, so this is optional |
+| `fund(amount)` | write | reads caller's vault balance, adds `amount` to lendable liquidity, instructs the vault to forward tokens onward |
+| `supply(amount)` | write | reads caller's vault balance and credits `amount` as collateral (tokens stay in the vault) |
+| `borrow(amount)` | write | **requires a ruling**; records debt, emits payout from lending's liquidity to the borrower's wallet, enforces LTV on recognized value |
+| `repay(amount)` | write | reads caller's vault balance, reduces debt by `amount`, instructs vault to forward tokens to lending |
+| `withdraw(amount)` | write | instructs caller's vault to send `amount` back to their wallet; re-checks LTV on recognized value |
+| `liquidate(user)` | write | **requires a ruling**; permissionless; seizes collateral by instructing the user's vault to forward to the pool (the swap follows in `advance_liquidation`) |
 | `advance_liquidation(liq_id)` / `settle_liquidation(liq_id)` | write | permissionless driver (same function, two names); emits the swap once collateral lands, retries a stalled swap, books proceeds, clears debt — idempotent per stage |
 | `set_trusted_dex` / `set_trusted_pool` | write | owner-only; repoint at redeployed contracts |
 
@@ -346,7 +344,7 @@ On Vercel, set the Root Directory to `web`.
 
 | contract | address |
 |---|---|
-| LendingProtocol (v7 — live web+LLM risk committee) | `0xDEA63B16f2e76beB68294fb325902E29944dAf1D` |
+| LendingProtocol (v7 — live web+LLM risk committee) | `0xA4db027a94120727f908A40AEA1f285b026c0D12` |
 | AMM pool (tGEN/tUSDC, 30bps) | `0x6A732A632972fC3cF8a76b3CfeE3356C549c761C` |
 | tGEN | `0xd978F743Ce2Bad27c00A329F44f8F16b401F556C` |
 | tUSDC | `0xa04E4F945d941eD491C194E2BD29A4da06c37f07` |
@@ -383,40 +381,39 @@ cleanly and is retried rather than corrupting state — but the saga does need
 someone to keep calling the driver until it returns the repaid amount. It does
 not self-trigger.
 
-**One liquidation at a time.** Settlement identifies proceeds by balance delta, so
-a global lock permits one pending liquidation. `repay()`/`fund()` refuse to run
-while a liquidation is awaiting its swap proceeds (`liq_stage == 2`), so those
-proceeds can never be counted as someone else's deposit.
+**One liquidation at a time.** A global lock permits one pending liquidation.
+The swap's proceeds are measured at the pool's **own reserve delta** and
+capped at the exact `min_out` the swap was committed to pay — anything
+unrelated moving *our* balance in the same window (a stray transfer, an
+in-flight borrow payout, dust) doesn't shift a pool reserve, so it can never
+be counted as our proceeds. A concurrent third-party swap on the same pool
+that drains more `reserve_b` than ours is bounded out too: the credited
+amount is `min_out`, not the raw delta.
 
-**Payout deltas are isolated from deposit deltas.** `borrow()`/`withdraw()`
-decrement `tracked_liquidity`/`tracked_collateral` the instant they emit a
-payout, but the async transfer settles later — until it does, the balance still
-sitting in the contract is earmarked in `pending_liquidity_out` /
-`pending_collateral_out` and excluded from what `supply()`/`fund()`/`repay()`
-will credit as a fresh deposit. Without this, an in-flight payout (or the same
-window race on liquidation proceeds above) could be double-counted and used to
-credit debt reduction or collateral to a caller who transferred nothing.
+**Custody is bound to per-user CREATE2 vaults.** Every earlier version pushed
+every user's deposits to the SAME shared address — the lending contract
+itself — so no accounting on top could tell whose transfer produced any given
+balance increase. That was the crack the steward flagged three rounds in a
+row, and every heuristic on top of it (balance-delta, commit-reveal,
+ticket-queue) was vulnerable to the same race: an earlier caller could sweep
+someone else's later transfer.
 
-**Credits are bound to whoever registered them, not whoever calls.** A balance
-delta alone can't tell WHOSE transfer produced an increase — only that one
-happened — so any caller could sweep an already-arrived, not-yet-claimed
-transfer just by calling `supply()`/`fund()`/`repay()` first, with zero setup
-of their own. Each call instead queues a numbered ticket (registrant, amount);
-settlement (the same call, immediately, if nothing is queued ahead of it, or a
-later `settle_supply()`/`settle_fund()`/`settle_repay()`) drains the queue in
-registration order, crediting the ticket's owner only from excess that clears
-everyone queued ahead of it. This is **not** a cryptographic proof of who sent
-a specific transfer — that would need an allowance/`transferFrom` the deployed
-tGEN/tUSDC tokens don't implement (this protocol has none, by design, per the
-custody model above). It's a weaker but real guarantee: nothing queued *later*
-can cut in front of a ticket already waiting. A ticket registered before
-transferring is protected against a later-registering third party; a transfer
-made before anyone has registered anything is first-come-first-served among
-tickets that exist once it lands, the same way any shared pool is. `repay()`
-tickets cap the credited amount at the registrant's outstanding debt at
-settlement time (it may have shrunk via a liquidation in between) rather than
-leaving the ticket stuck. Each drain is capped at `MAX_DRAIN` (20) tickets per
-call so a long backlog can't make a single call run out of gas.
+v8 removes the shared address. On first use, `LendingProtocol` deploys the
+caller a personal vault at a **deterministic CREATE2 address** (via
+`gl.deploy_contract` with a per-user salt). Every deposit path — supply,
+fund, repay — reads the CALLER'S OWN vault balance, not the lending
+contract's balance. Since tokens sitting in Alice's vault are Alice's by the
+custody model itself, credit is bound to `msg.sender` by construction, not
+by a heuristic. Nobody else's `supply()` call ever looks at Alice's vault,
+and Alice's `supply()` call ignores lending's own balance entirely — a stray
+transfer to lending is invisible to the credit path.
+
+The vault is small (owner + lending + a single `forward` method) and only
+lending can drain it (`forward` rejects any other caller). Withdrawal
+instructs the vault to send tokens back to the user's wallet; liquidation
+instructs the vault to send collateral to the pool. Borrowing pays out
+directly from lending's own liquidity balance to the borrower's wallet
+(no attribution needed on the outbound leg).
 
 **studionet simulates consensus.** The appeal window and message re-execution
 aren't exercised as a real network would. Settlement is idempotent regardless, but

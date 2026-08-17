@@ -41,6 +41,12 @@ type State = {
   liqPending: boolean;
   quoteRef: string;
   quoteRecognized: string;
+  // v8 vault-based custody: the deterministic CREATE2 address the user must
+  // transfer tokens to before supply/fund/repay. Same address whether or
+  // not the vault contract is actually deployed yet.
+  vault: string;
+  vaultTgenBalance: string;
+  vaultTusdcBalance: string;
   errors: string[];
 };
 
@@ -385,10 +391,11 @@ export default function LendingCard() {
 
           <div className="actions">
             <button
-              disabled={disabled}
+              disabled={disabled || !state?.vault}
+              title={state?.vault ? "" : "Reading your vault address…"}
               onClick={() =>
                 run("supply", [
-                  [TGEN, "transfer", [addr(LENDING), amt], "Sending tGEN"],
+                  [TGEN, "transfer", [addr(state!.vault), amt], "Sending tGEN to your vault"],
                   [LENDING, "supply", [amt], "Crediting collateral"],
                 ])
               }
@@ -405,10 +412,10 @@ export default function LendingCard() {
             </button>
 
             <button
-              disabled={disabled}
+              disabled={disabled || !state?.vault}
               onClick={() =>
                 run("repay", [
-                  [TUSDC, "transfer", [addr(LENDING), amt], "Sending tUSDC"],
+                  [TUSDC, "transfer", [addr(state!.vault), amt], "Sending tUSDC to your vault"],
                   [LENDING, "repay", [amt], "Clearing debt"],
                 ])
               }
@@ -427,10 +434,10 @@ export default function LendingCard() {
 
             <button
               className="ghost"
-              disabled={disabled}
+              disabled={disabled || !state?.vault}
               onClick={() =>
                 run("fund", [
-                  [TUSDC, "transfer", [addr(LENDING), amt], "Sending tUSDC"],
+                  [TUSDC, "transfer", [addr(state!.vault), amt], "Sending tUSDC to your vault"],
                   [LENDING, "fund", [amt], "Adding lendable liquidity"],
                 ])
               }
@@ -439,10 +446,25 @@ export default function LendingCard() {
             </button>
           </div>
 
+          {state?.vault && (
+            <p className="note">
+              <b>Your vault: </b>
+              <span className="mono small">{short(state.vault)}</span>
+              {" "}holds{" "}
+              <b className="mono">{state.vaultTgenBalance}</b> tGEN,{" "}
+              <b className="mono">{state.vaultTusdcBalance}</b> tUSDC.
+              Supply/repay/fund transfer to your vault first (each user gets
+              their own vault address, so no other caller can claim your
+              deposit); borrow and withdraw send from lending or the vault
+              back to your wallet.
+            </p>
+          )}
+
           <p className="note">
             Supplying, repaying and funding each take two transactions: the
-            tokens move first, then the protocol books what it received. Borrowed
-            and withdrawn tokens arrive one consensus round after the call.
+            tokens move to your vault first, then the protocol books what it
+            received. Borrowed and withdrawn tokens arrive one consensus
+            round after the call.
           </p>
         </section>
 
